@@ -431,7 +431,9 @@ int main(int argc, char** argv) {
                     doConfirm();
                 } else {
                     float lx, ly;
-                    windowToLogical(e.button.x, e.button.y, lx, ly);
+                    //windowToLogical(e.button.x, e.button.y, lx, ly);
+                    lx=float(e.button.x);
+                    ly=float(e.button.y);
                     int best = 0; float bestDist = 1e9f;
                     for (int i = 0; i < 3; i++) {
                         float d = std::fabs(lx - (float)ZONE_X[i]);
