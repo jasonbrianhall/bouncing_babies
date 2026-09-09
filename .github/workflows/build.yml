@@ -1,4 +1,4 @@
-name: Build Bouncing Babies
+name: Build Baby Bounce Rescue
 
 on:
   push:
@@ -157,17 +157,17 @@ jobs:
         <Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
 
           <Product Id="*"
-                   Name="Bouncing Babies"
+                   Name="Baby Bounce Rescue"
                    Language="1033"
                    Version="$version"
-                   Manufacturer="Bouncing Babies"
+                   Manufacturer="jasonbrianhall"
                    UpgradeCode="$upgradeCode">
 
             <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine"
-                     Description="Bouncing Babies - SDL Accelerated Video Game"
-                     Manufacturer="Bouncing Babies" />
+                     Description="Baby Bounce Rescue - SDL Accelerated Video Game"
+                     Manufacturer="Baby Bounce Rescue" />
 
-            <MajorUpgrade DowngradeErrorMessage="A newer version of Bouncing Babies is already installed."
+            <MajorUpgrade DowngradeErrorMessage="A newer version of Baby Bounce Rescue is already installed."
                           Schedule="afterInstallInitialize" />
             <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
 
@@ -183,10 +183,10 @@ jobs:
 
             <Directory Id="TARGETDIR" Name="SourceDir">
               <Directory Id="ProgramFiles64Folder">
-                <Directory Id="INSTALLFOLDER" Name="Bouncing Babies" />
+                <Directory Id="INSTALLFOLDER" Name="Baby Bounce Rescue" />
               </Directory>
               <Directory Id="ProgramMenuFolder">
-                <Directory Id="ApplicationProgramsFolder" Name="Bouncing Babies" />
+                <Directory Id="ApplicationProgramsFolder" Name="Baby Bounce Rescue" />
               </Directory>
               <Directory Id="DesktopFolder" />
             </Directory>
@@ -199,8 +199,8 @@ jobs:
                 <!-- Start Menu shortcut -->
                 <Shortcut Id="StartMenuShortcut"
                           Directory="ApplicationProgramsFolder"
-                          Name="Bouncing Babies"
-                          Description="Bouncing Babies - SDL Accelerated Video Game"
+                          Name="Baby Bounce Rescue"
+                          Description="Baby Bounce Rescue - SDL Accelerated Video Game"
                           Target="[INSTALLFOLDER]bouncingbabies.exe"
                           WorkingDirectory="INSTALLFOLDER"
                           Icon="BouncingBabiesIcon"
@@ -230,8 +230,8 @@ jobs:
                 <Condition>DESKTOP_SHORTCUT=1</Condition>
                 <Shortcut Id="DesktopShortcutMain"
                           Directory="DesktopFolder"
-                          Name="Bouncing Babies"
-                          Description="Bouncing Babies - SDL Accelerated Video Game"
+                          Name="Baby Bounce Rescue"
+                          Description="Baby Bounce Rescue - SDL Accelerated Video Game"
                           Target="[INSTALLFOLDER]bouncingbabies.exe"
                           WorkingDirectory="INSTALLFOLDER"
                           Icon="BouncingBabiesIcon"
@@ -242,7 +242,7 @@ jobs:
               </Component>
             </DirectoryRef>
 
-            <Feature Id="MainFeature" Title="Bouncing Babies" Level="1">
+            <Feature Id="MainFeature" Title="Baby Bounce Rescue" Level="1">
               <ComponentRef Id="MainExecutable" />
               <ComponentRef Id="StartMenuFolder" />
               <ComponentRef Id="DesktopShortcut" />
@@ -269,7 +269,7 @@ jobs:
         \pard\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\pardirnatural\partightenfactor0
         \f0\fs20 \cf0 MIT License\
         \
-        Copyright (c) 2025 Bouncing Babies Contributors\
+        Copyright (c) 2025 Baby Bounce Rescue Contributors\
         \
         Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:\
         \
@@ -400,7 +400,7 @@ jobs:
             ProcessorArchitecture="${{ matrix.arch }}" />
 
           <Properties>
-            <DisplayName>Bouncing Babies</DisplayName>
+            <DisplayName>Baby Bounce Rescue</DisplayName>
             <PublisherDisplayName>Jason Brian Hall</PublisherDisplayName>
             <Description>An SDL built video game.</Description>
             <Logo>Assets\StoreLogo.scale-100.png</Logo>
@@ -416,13 +416,13 @@ jobs:
 
           <Applications>
             <Application Id="BouncingBabies" Executable="Files\bouncingbabies.exe" EntryPoint="Windows.FullTrustApplication">
-              <uap:VisualElements DisplayName="Bouncing Babies"
+              <uap:VisualElements DisplayName="Baby Bounce Rescue"
                                   Description="An SDL built video game."
                                   Square150x150Logo="Assets\BouncingBabiesLogo.scale-100.png"
                                   Square44x44Logo="Assets\BouncingBabies44x44.scale-100.png"
                                   BackgroundColor="#0d1117">
                 <uap:DefaultTile Wide310x150Logo="Assets\BouncingBabiesWide.scale-100.png"
-                                 ShortName="Bouncing Babies">
+                                 ShortName="Baby Bounce Rescue">
                   <uap:ShowNameOnTiles>
                     <uap:ShowOn Tile="square150x150Logo"/>
                     <uap:ShowOn Tile="wide310x150Logo"/>
@@ -532,7 +532,7 @@ jobs:
           **Commit:** ${{ github.sha }}
           **Build:** #${{ github.run_number }}
 
-          ### 👶 Bouncing Babies
+          ### 👶 Baby Bounce Rescue
           An SDL accelerated video game for Windows and Linux.
 
           ### 📦 Downloads
