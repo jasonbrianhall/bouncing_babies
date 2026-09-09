@@ -1,4 +1,4 @@
-// Bouncing Babies — SDL2 remake
+// Bouncing Babies — Copyright 2026 Jason Brian Hall
 // Building is fixed on the LEFT, ambulance fixed on the RIGHT.
 // A single two-man firefighter team moves between 3 zones (near building,
 // mid-screen, near ambulance). A baby falls from the building, and each
