@@ -1,4 +1,4 @@
-// Bouncing Babies — Copyright 2026 Jason Brian Hall
+// Baby Bounce Rescue — Copyright 2026 Jason Brian Hall
 // Building is fixed on the LEFT, ambulance fixed on the RIGHT.
 // A single two-man firefighter team moves between 3 zones (near building,
 // mid-screen, near ambulance). A baby falls from the building, and each
@@ -363,7 +363,7 @@ int main(int argc, char** argv) {
         SDL_Log("TTF_Init failed: %s", TTF_GetError());
     }
 
-    gWindow = SDL_CreateWindow("Bouncing Babies",
+    gWindow = SDL_CreateWindow("Baby Bounce Rescue",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
         SCREEN_W, SCREEN_H, SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
     gRenderer = SDL_CreateRenderer(gWindow, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
@@ -617,7 +617,7 @@ int main(int argc, char** argv) {
 
             SDL_Color white{ 255, 255, 255, 255 };
             SDL_Color gold{ 230, 210, 60, 255 };
-            drawText("BOUNCING BABIES", SCREEN_W/2, SCREEN_H/2 - 150, gold, gFontBig, true);
+            drawText("Baby Bounce Rescue", SCREEN_W/2, SCREEN_H/2 - 150, gold, gFontBig, true);
             drawText("Catch the falling babies and get them to the ambulance!", SCREEN_W/2, SCREEN_H/2 - 60, white, gFont, true);
             drawText("LEFT / RIGHT arrows - move between zones", SCREEN_W/2, SCREEN_H/2 - 20, white, gFont, true);
             drawText("1 / 2 / 3 - jump straight to a zone", SCREEN_W/2, SCREEN_H/2 + 10, white, gFont, true);
