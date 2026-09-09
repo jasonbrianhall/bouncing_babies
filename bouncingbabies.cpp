@@ -6,6 +6,7 @@
 // bounce carries it into the ambulance.
 //
 // Build: g++ main.cpp -o bouncing_babies `sdl2-config --cflags --libs` -lSDL2_ttf -std=c++17
+// See CMAKE File
 
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_ttf.h>
