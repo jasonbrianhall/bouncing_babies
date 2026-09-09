@@ -55,6 +55,29 @@ static TTF_Font* gFontBig = nullptr;
 static SDL_AudioDeviceID gAudioDev = 0;
 static SDL_AudioSpec gAudioSpec;
 
+// Current oversampling factor the loaded fonts were rendered at. When the
+// window is bigger than the logical SCREEN_W x SCREEN_H canvas, we reload
+// the fonts at a proportionally larger point size so the glyph textures
+// have enough pixels to stay sharp once SDL's logical-size scaling stretches
+// them up to the real window resolution, instead of just blowing up a
+// small, blurry texture.
+static float gFontRenderScale = 1.0f;
+static const int FONT_BASE_SIZE = 22;
+static const int FONT_BASE_SIZE_BIG = 48;
+
+void loadFontsAtScale(float scale) {
+    scale = std::clamp(scale, 0.5f, 4.0f);
+    if (gFont) { TTF_CloseFont(gFont); gFont = nullptr; }
+    if (gFontBig) { TTF_CloseFont(gFontBig); gFontBig = nullptr; }
+    int sz = std::max(1, (int)std::lround(FONT_BASE_SIZE * scale));
+    int szBig = std::max(1, (int)std::lround(FONT_BASE_SIZE_BIG * scale));
+    SDL_RWops* fontRW1 = SDL_RWFromConstMem(bb_font_data, (int)bb_font_data_len);
+    gFont = TTF_OpenFontRW(fontRW1, 1 /*freesrc*/, sz);
+    SDL_RWops* fontRW2 = SDL_RWFromConstMem(bb_font_data, (int)bb_font_data_len);
+    gFontBig = TTF_OpenFontRW(fontRW2, 1 /*freesrc*/, szBig);
+    gFontRenderScale = scale;
+}
+
 void playTone(float startFreq, float endFreq, float durationSec, float volume = 0.25f) {
     if (gAudioDev == 0) return;
     int sampleRate = gAudioSpec.freq;
@@ -82,16 +105,47 @@ void fillRect(int x, int y, int w, int h, SDL_Color c) {
     SDL_RenderFillRect(gRenderer, &r);
 }
 
+void fillCircle(int cx, int cy, int r, SDL_Color c); // fwd decl - used by drawBuilding/drawFirefighters below
+
 void drawText(const std::string& s, int x, int y, SDL_Color c, TTF_Font* font, bool center = false) {
     if (!font) return;
     SDL_Surface* surf = TTF_RenderText_Blended(font, s.c_str(), c);
     if (!surf) return;
     SDL_Texture* tex = SDL_CreateTextureFromSurface(gRenderer, surf);
-    SDL_Rect dst{ x, y, surf->w, surf->h };
-    if (center) dst.x -= surf->w / 2;
+    // The texture may have been rendered at gFontRenderScale x the logical
+    // point size (see loadFontsAtScale); shrink the destination rect back
+    // down to logical units so layout is unaffected - SDL's own logical-size
+    // scaling then stretches it back up to real pixels using the extra
+    // source detail instead of upscaling a small texture.
+    int dstW = (int)std::lround(surf->w / gFontRenderScale);
+    int dstH = (int)std::lround(surf->h / gFontRenderScale);
+    SDL_Rect dst{ x, y, dstW, dstH };
+    if (center) dst.x -= dstW / 2;
     SDL_RenderCopy(gRenderer, tex, nullptr, &dst);
     SDL_FreeSurface(surf);
     SDL_DestroyTexture(tex);
+}
+
+// One flickering flame "tongue": a stack of narrowing, wobbling rows that
+// go red -> orange -> yellow -> near-white from base to tip, so it reads as
+// a flame shape rather than a flat rectangle.
+void drawFlameLick(int baseCx, int baseY, int width, int height, float t, float phaseOffset) {
+    const int steps = 12;
+    for (int i = 0; i < steps; i++) {
+        float frac = i / (float)(steps - 1); // 0 = base, 1 = tip
+        float wobble = std::sin(t * 9.0f + phaseOffset + frac * 4.0f) * width * 0.18f * frac;
+        float w = std::max(1.0f, width * (1.0f - frac * 0.88f));
+        int rowH = std::max(1, height / steps + 1);
+        int rowY = baseY - (int)(frac * height);
+        int rowCx = baseCx + (int)wobble;
+
+        Uint8 r = 255;
+        Uint8 g = (Uint8)(50 + frac * 190);
+        Uint8 b = (Uint8)(frac * frac * 120);
+        Uint8 a = (Uint8)(255 - frac * 40);
+        SDL_Color c{ r, g, b, a };
+        fillRect(rowCx - (int)(w / 2), rowY, (int)w, rowH, c);
+    }
 }
 
 void drawBuilding(float flamePhase) {
@@ -105,12 +159,24 @@ void drawBuilding(float flamePhase) {
         int wy = WINDOW_Y[row];
         SDL_Color frame{ 40, 25, 20, 255 };
         fillRect(WINDOW_X - 4, wy - 4, 54, 58, frame);
-        float flick = 0.5f + 0.5f * std::sin(flamePhase * 6.0f + row * 1.7f);
-        SDL_Color fireC{ (Uint8)(200 + 55 * flick), (Uint8)(90 + 60 * flick), 20, 255 };
-        fillRect(WINDOW_X, wy, 46, 50, fireC);
-        SDL_Color innerFire{ 255, (Uint8)(200 * flick), 60, 255 };
-        int fw = 20 + (int)(8 * flick);
-        fillRect(WINDOW_X + 23 - fw/2, wy + 25 - fw/2, fw, fw, innerFire);
+
+        // Dark interior behind the flames instead of a flat orange fill.
+        SDL_Color interior{ 25, 10, 8, 255 };
+        fillRect(WINDOW_X, wy, 46, 50, interior);
+
+        float t = flamePhase + row * 1.7f;
+        int baseY = wy + 48;
+
+        // Hot glow low in the window, behind the licks.
+        float glow = 0.5f + 0.5f * std::sin(t * 5.0f);
+        SDL_Color glowC{ 255, (Uint8)(120 + 60 * glow), 40, 200 };
+        fillCircle(WINDOW_X + 23, baseY - 6, (int)(16 + 4 * glow), glowC);
+
+        // A cluster of 3 overlapping flame tongues of different heights so
+        // the fire has a jagged, moving silhouette instead of one blob.
+        drawFlameLick(WINDOW_X + 12, baseY, 20, 34 + (int)(6 * std::sin(t * 3.1f)), t, 0.0f);
+        drawFlameLick(WINDOW_X + 23, baseY, 26, 46 + (int)(8 * std::sin(t * 2.3f + 1.5f)), t, 2.1f);
+        drawFlameLick(WINDOW_X + 34, baseY, 18, 30 + (int)(6 * std::sin(t * 2.7f + 0.8f)), t, 4.2f);
     }
 }
 
@@ -118,6 +184,8 @@ void drawFirefighters(const Firefighters& ff) {
     SDL_Color skin{ 235, 190, 150, 255 };
     SDL_Color uniform{ 40, 40, 200, 255 };
     SDL_Color helmet{ 230, 210, 60, 255 };
+    SDL_Color eyeC{ 30, 25, 20, 255 };
+    SDL_Color mouthC{ 150, 70, 60, 255 };
 
     // paramedic 1 (left side, facing right toward stretcher)
     fillRect((int)ff.x - 66, (int)ff.y - 26, 10, 26, uniform); // leg
@@ -126,6 +194,10 @@ void drawFirefighters(const Firefighters& ff) {
     fillRect((int)ff.x - 60, (int)ff.y - 62, 14, 14, skin);    // head
     fillRect((int)ff.x - 62, (int)ff.y - 66, 18, 5, helmet);   // helmet
     fillRect((int)ff.x - 44, (int)ff.y - 22, 14, 8, skin);     // arm gripping stretcher
+    // face: looking right (toward the far side), so features sit on the
+    // forward half of the head.
+    fillRect((int)ff.x - 51, (int)ff.y - 57, 2, 2, eyeC);      // eye
+    fillRect((int)ff.x - 51, (int)ff.y - 53, 3, 1, mouthC);    // mouth
 
     // paramedic 2 (right side, mirrored, facing left toward stretcher)
     fillRect((int)ff.x + 44, (int)ff.y - 26, 10, 26, uniform);
@@ -134,6 +206,9 @@ void drawFirefighters(const Firefighters& ff) {
     fillRect((int)ff.x + 46, (int)ff.y - 62, 14, 14, skin);
     fillRect((int)ff.x + 48, (int)ff.y - 66, 18, 5, helmet);
     fillRect((int)ff.x + 30, (int)ff.y - 22, 14, 8, skin);
+    // face: mirrored, looking left toward paramedic 1.
+    fillRect((int)ff.x + 49, (int)ff.y - 57, 2, 2, eyeC);
+    fillRect((int)ff.x + 48, (int)ff.y - 53, 3, 1, mouthC);
 
     // stretcher canvas, gripped between the two paramedics' hands
     SDL_Color canvas{ 220, 40, 40, 255 };
@@ -215,7 +290,7 @@ void launchBounce(Baby& b, int fromZone, int toZone, float vy0, float gravity) {
 int main(int argc, char** argv) {
     srand((unsigned)time(nullptr));
 
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO) != 0) {
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_JOYSTICK | SDL_INIT_GAMECONTROLLER) != 0) {
         SDL_Log("SDL_Init failed: %s", SDL_GetError());
         return 1;
     }
@@ -225,16 +300,19 @@ int main(int argc, char** argv) {
 
     gWindow = SDL_CreateWindow("Bouncing Babies",
         SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-        SCREEN_W, SCREEN_H, SDL_WINDOW_SHOWN);
+        SCREEN_W, SCREEN_H, SDL_WINDOW_SHOWN | SDL_WINDOW_RESIZABLE);
     gRenderer = SDL_CreateRenderer(gWindow, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
+    SDL_SetRenderDrawBlendMode(gRenderer, SDL_BLENDMODE_BLEND); // so alpha in fillRect/overlays actually blends
+    // Keep everything drawn at the fixed SCREEN_W x SCREEN_H layout; SDL
+    // scales it (letterboxed, aspect preserved) to whatever the window or
+    // fullscreen display actually is, so resizing/F11 doesn't require
+    // touching any of the drawing code below.
+    SDL_RenderSetLogicalSize(gRenderer, SCREEN_W, SCREEN_H);
 
     // Font is embedded directly in the binary (font_data.h) so text always
     // renders regardless of what fonts happen to be installed on this
     // machine - no filesystem paths to guess at all.
-    SDL_RWops* fontRW1 = SDL_RWFromConstMem(bb_font_data, (int)bb_font_data_len);
-    gFont = TTF_OpenFontRW(fontRW1, 1 /*freesrc*/, 22);
-    SDL_RWops* fontRW2 = SDL_RWFromConstMem(bb_font_data, (int)bb_font_data_len);
-    gFontBig = TTF_OpenFontRW(fontRW2, 1 /*freesrc*/, 48);
+    loadFontsAtScale(1.0f);
     if (!gFont || !gFontBig) {
         SDL_Log("WARNING: embedded font failed to load (%s). Text will not render.",
                 TTF_GetError());
@@ -248,6 +326,18 @@ int main(int argc, char** argv) {
     gAudioDev = SDL_OpenAudioDevice(nullptr, 0, &want, &gAudioSpec, 0);
     if (gAudioDev) SDL_PauseAudioDevice(gAudioDev, 0);
 
+    // Optional joystick/gamepad: opens the first one plugged in, if any.
+    // Uses the plain SDL_Joystick API (axis 0 = horizontal stick/d-pad,
+    // any button = confirm) rather than the SDL_GameController mapping
+    // database, so it works with generic controllers too.
+    SDL_Joystick* gJoystick = nullptr;
+    if (SDL_NumJoysticks() > 0) {
+        gJoystick = SDL_JoystickOpen(0);
+        if (gJoystick) SDL_Log("Joystick connected: %s", SDL_JoystickName(gJoystick));
+    }
+    int joyAxisDir = 0;   // last edge-triggered horizontal direction, so a held stick only moves once
+    int joyHatDir = 0;
+
     Firefighters ff;
     ff.zone = 0;
     ff.x = (float)ZONE_X[0];
@@ -260,11 +350,59 @@ int main(int argc, char** argv) {
     int level = 1;
     float spawnTimer = 0.f;
     float spawnInterval = 3.2f;
+    float doubleSpawnTimer = -1.f; // >=0 while counting down to a level-4+ "double throw" second baby
     float flamePhase = 0.f;
     bool gameOver = false;
     bool running = true;
+    bool isFullscreen = false;
+    bool introScreen = true;
 
     Uint32 lastTicks = SDL_GetTicks();
+
+    // Shared input actions so keyboard, mouse, and joystick/controller all
+    // drive the exact same behavior instead of duplicating this logic per
+    // input device.
+    auto doConfirm = [&]() {
+        if (introScreen) {
+            introScreen = false;
+        } else if (gameOver) {
+            babies.clear();
+            score = 0;
+            lives = 5;
+            level = 1;
+            spawnInterval = 3.2f;
+            doubleSpawnTimer = -1.f;
+            gameOver = false;
+        }
+    };
+    auto doCycle = [&](int dir) { // dir: -1 = left, +1 = right
+        if (introScreen) { introScreen = false; return; }
+        if (gameOver) return;
+        ff.zone = (ff.zone + dir + 3) % 3;
+    };
+    auto doSelectZone = [&](int zone) {
+        if (introScreen) { introScreen = false; return; }
+        if (gameOver) return;
+        ff.zone = zone;
+    };
+    // Converts raw window pixel coordinates (as reported by mouse events)
+    // into the fixed SCREEN_W x SCREEN_H logical space everything else is
+    // drawn in, undoing SDL's letterbox viewport/scale. Computed directly
+    // from the current window size (same formula SDL itself uses for
+    // SDL_RenderSetLogicalSize's letterboxing) rather than read back via
+    // SDL_RenderGetViewport/GetScale, since those can still reflect the
+    // previous frame's size for a moment while a resize is in progress.
+    auto windowToLogical = [&](int wx, int wy, float& lx, float& ly) {
+        int winW = 0, winH = 0;
+        SDL_GetWindowSize(gWindow, &winW, &winH);
+        float scale = std::min((float)winW / SCREEN_W, (float)winH / SCREEN_H);
+        float viewW = SCREEN_W * scale;
+        float viewH = SCREEN_H * scale;
+        float offX = (winW - viewW) / 2.0f;
+        float offY = (winH - viewH) / 2.0f;
+        lx = (wx - offX) / scale;
+        ly = (wy - offY) / scale;
+    };
 
     while (running) {
         Uint32 nowTicks = SDL_GetTicks();
@@ -278,33 +416,110 @@ int main(int argc, char** argv) {
             if (e.type == SDL_KEYDOWN) {
                 SDL_Keycode k = e.key.keysym.sym;
                 if (k == SDLK_ESCAPE) running = false;
-                if (!gameOver) {
-                    if (k == SDLK_1 || k == SDLK_LEFT)  ff.zone = 0;
-                    if (k == SDLK_2 || k == SDLK_UP)    ff.zone = 1;
-                    if (k == SDLK_3 || k == SDLK_RIGHT) ff.zone = 2;
+                if (k == SDLK_F11) {
+                    isFullscreen = !isFullscreen;
+                    SDL_SetWindowFullscreen(gWindow, isFullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
+                } else if (k == SDLK_LEFT)  doCycle(-1);
+                else if (k == SDLK_RIGHT) doCycle(1);
+                else if (k == SDLK_1) doSelectZone(0);
+                else if (k == SDLK_2 || k == SDLK_UP) doSelectZone(1);
+                else if (k == SDLK_3) doSelectZone(2);
+                else if (k == SDLK_RETURN) doConfirm();
+                else if (introScreen && k != SDLK_ESCAPE) doConfirm(); // any other key on the intro screen starts the game
+            } else if (e.type == SDL_MOUSEBUTTONDOWN && e.button.button == SDL_BUTTON_LEFT) {
+                if (introScreen || gameOver) {
+                    doConfirm();
+                } else {
+                    float lx, ly;
+                    windowToLogical(e.button.x, e.button.y, lx, ly);
+                    int best = 0; float bestDist = 1e9f;
+                    for (int i = 0; i < 3; i++) {
+                        float d = std::fabs(lx - (float)ZONE_X[i]);
+                        if (d < bestDist) { bestDist = d; best = i; }
+                    }
+                    doSelectZone(best);
                 }
-                if (gameOver && k == SDLK_RETURN) {
-                    babies.clear();
-                    score = 0;
-                    lives = 5;
-                    level = 1;
-                    spawnInterval = 3.2f;
-                    gameOver = false;
-                }
+            } else if (e.type == SDL_JOYBUTTONDOWN) {
+                doConfirm();
+            } else if (e.type == SDL_JOYHATMOTION) {
+                int dir = 0;
+                if (e.jhat.value & SDL_HAT_LEFT) dir = -1;
+                else if (e.jhat.value & SDL_HAT_RIGHT) dir = 1;
+                if (dir != 0 && dir != joyHatDir) doCycle(dir);
+                joyHatDir = dir;
+            } else if (e.type == SDL_JOYAXISMOTION && e.jaxis.axis == 0) {
+                const Sint16 deadzone = 12000;
+                int dir = 0;
+                if (e.jaxis.value < -deadzone) dir = -1;
+                else if (e.jaxis.value > deadzone) dir = 1;
+                if (dir != 0 && dir != joyAxisDir) doCycle(dir);
+                joyAxisDir = dir;
             }
         }
 
         ff.x = (float)ZONE_X[ff.zone];
         flamePhase += dt;
 
+        // If the window (or fullscreen display) is now noticeably bigger
+        // or smaller relative to the logical canvas, reload the fonts at a
+        // matching point size so text stays crisp instead of blurry when
+        // stretched. Cheap check every frame; the (relatively) expensive
+        // font reload only fires on an actual size change.
+        {
+            int winW = 0, winH = 0;
+            SDL_GetWindowSize(gWindow, &winW, &winH);
+            float scale = std::min((float)winW / SCREEN_W, (float)winH / SCREEN_H);
+            scale = std::clamp(scale, 0.5f, 4.0f);
+            if (std::fabs(scale - gFontRenderScale) > 0.05f) {
+                loadFontsAtScale(scale);
+            }
+        }
+
+        if (introScreen) {
+            SDL_SetRenderDrawColor(gRenderer, 15, 15, 30, 255);
+            SDL_RenderClear(gRenderer);
+            for (int i = 0; i < 6; i++) {
+                SDL_Color c{ (Uint8)(15 + i*3), (Uint8)(15 + i*2), (Uint8)(40 + i*5), 255 };
+                fillRect(0, i * (GROUND_Y/6), SCREEN_W, GROUND_Y/6 + 1, c);
+            }
+
+            // Real scene as a backdrop: burning building, ground, ambulance,
+            // and the paramedic team idling at mid-screen - same art as the
+            // actual game, just static/no gameplay running yet.
+            drawBuilding(flamePhase);
+            drawAmbulance();
+            SDL_Color groundColor{ 60, 60, 60, 255 };
+            fillRect(0, GROUND_Y, SCREEN_W, SCREEN_H - GROUND_Y, groundColor);
+            Firefighters introFF;
+            introFF.zone = 1;
+            introFF.x = (float)ZONE_X[1];
+            introFF.y = (float)GROUND_Y - 20;
+            drawFirefighters(introFF);
+
+            // Dark translucent panel behind the title/instructions so they
+            // stay readable over the busy scene.
+            SDL_Color panel{ 10, 10, 20, 165 };
+            fillRect(0, SCREEN_H/2 - 190, SCREEN_W, 360, panel);
+
+            SDL_Color white{ 255, 255, 255, 255 };
+            SDL_Color gold{ 230, 210, 60, 255 };
+            drawText("BOUNCING BABIES", SCREEN_W/2, SCREEN_H/2 - 150, gold, gFontBig, true);
+            drawText("Catch the falling babies and get them to the ambulance!", SCREEN_W/2, SCREEN_H/2 - 60, white, gFont, true);
+            drawText("LEFT / RIGHT arrows - move between zones", SCREEN_W/2, SCREEN_H/2 - 20, white, gFont, true);
+            drawText("1 / 2 / 3 - jump straight to a zone", SCREEN_W/2, SCREEN_H/2 + 10, white, gFont, true);
+            drawText("Click a zone, or use a controller's stick/D-pad", SCREEN_W/2, SCREEN_H/2 + 40, white, gFont, true);
+            drawText("F11 - toggle fullscreen        ESC - quit", SCREEN_W/2, SCREEN_H/2 + 70, white, gFont, true);
+            drawText("Press any key, click, or press a button to start", SCREEN_W/2, SCREEN_H/2 + 120, gold, gFont, true);
+            SDL_RenderPresent(gRenderer);
+            continue;
+        }
+
         if (!gameOver) {
             float gravity = 620.f;
             float groundLevel = (float)GROUND_Y - 20;   // true ground height (used for misses)
             float catchY = (float)GROUND_Y - 42;         // height of the stretcher surface (used for catches)
 
-            spawnTimer += dt;
-            if (spawnTimer >= spawnInterval) {
-                spawnTimer = 0.f;
+            auto spawnOneBaby = [&]() {
                 int row = 0; // topmost window = the 4th floor
                 Baby b;
                 b.x = (float)WINDOW_X + 23.f;   // start inside the window
@@ -320,6 +535,33 @@ int main(int argc, char** argv) {
                 b.vy = (catchY - b.y - 0.5f * gravity * flightDuration * flightDuration) / flightDuration;
 
                 babies.push_back(b);
+            };
+
+            spawnTimer += dt;
+            if (spawnTimer >= spawnInterval) {
+                spawnTimer = 0.f;
+                spawnOneBaby();
+
+                // From level 4 on, there's a growing chance the throw is a
+                // "double" - a second baby tossed out just behind the
+                // first, ramping up in both frequency and how tight the
+                // gap is as the level climbs, so late levels demand
+                // catching two in a row instead of one at a time.
+                if (level >= 4) {
+                    float doubleChance = std::min(0.85f, (level - 3) * 0.15f);
+                    if ((float)rand() / (float)RAND_MAX < doubleChance) {
+                        float gap = std::max(0.10f, 0.25f - (level - 4) * 0.02f);
+                        doubleSpawnTimer = gap;
+                    }
+                }
+            }
+
+            if (doubleSpawnTimer >= 0.f) {
+                doubleSpawnTimer -= dt;
+                if (doubleSpawnTimer <= 0.f) {
+                    doubleSpawnTimer = -1.f;
+                    spawnOneBaby();
+                }
             }
 
             spawnInterval = std::max(0.55f, 3.2f - (level - 1) * 0.22f);
@@ -430,7 +672,6 @@ int main(int argc, char** argv) {
         SDL_Color white{ 255, 255, 255, 255 };
         drawText("Lives: " + std::to_string(std::max(0, lives)), 20, 15, white, gFont);
         drawText("Level: " + std::to_string(level), 20, 45, white, gFont);
-        drawText("Keys: 1=Near bldg 2=Mid 3=Near ambulance", SCREEN_W/2, 15, white, gFont, true);
 
         // big score text, top right (no box/border)
         {
@@ -454,6 +695,7 @@ int main(int argc, char** argv) {
     }
 
     if (gAudioDev) SDL_CloseAudioDevice(gAudioDev);
+    if (gJoystick) SDL_JoystickClose(gJoystick);
     if (gFont) TTF_CloseFont(gFont);
     if (gFontBig) TTF_CloseFont(gFontBig);
     TTF_Quit();
