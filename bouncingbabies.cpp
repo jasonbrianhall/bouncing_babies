@@ -385,24 +385,6 @@ int main(int argc, char** argv) {
         if (gameOver) return;
         ff.zone = zone;
     };
-    // Converts raw window pixel coordinates (as reported by mouse events)
-    // into the fixed SCREEN_W x SCREEN_H logical space everything else is
-    // drawn in, undoing SDL's letterbox viewport/scale. Computed directly
-    // from the current window size (same formula SDL itself uses for
-    // SDL_RenderSetLogicalSize's letterboxing) rather than read back via
-    // SDL_RenderGetViewport/GetScale, since those can still reflect the
-    // previous frame's size for a moment while a resize is in progress.
-    auto windowToLogical = [&](int wx, int wy, float& lx, float& ly) {
-        int winW = 0, winH = 0;
-        SDL_GetWindowSize(gWindow, &winW, &winH);
-        float scale = std::min((float)winW / SCREEN_W, (float)winH / SCREEN_H);
-        float viewW = SCREEN_W * scale;
-        float viewH = SCREEN_H * scale;
-        float offX = (winW - viewW) / 2.0f;
-        float offY = (winH - viewH) / 2.0f;
-        lx = (wx - offX) / scale;
-        ly = (wy - offY) / scale;
-    };
 
     while (running) {
         Uint32 nowTicks = SDL_GetTicks();
