@@ -7,7 +7,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(SDL2 CONFIG REQUIRED)
 find_package(SDL2_ttf CONFIG REQUIRED)
 
-add_executable(bouncingbabies bouncingbabies.cpp)
+add_executable(bouncingbabies WIN32 bouncingbabies.cpp)
+
 
 target_link_libraries(bouncingbabies PRIVATE
     $<TARGET_NAME_IF_EXISTS:SDL2::SDL2main>
