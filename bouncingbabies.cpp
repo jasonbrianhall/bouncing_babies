@@ -9,6 +9,7 @@
 
 #include <SDL2/SDL.h>
 #include <SDL2/SDL_ttf.h>
+#include "font_data.h"
 #include <vector>
 #include <cmath>
 #include <cstdlib>
@@ -227,15 +228,16 @@ int main(int argc, char** argv) {
         SCREEN_W, SCREEN_H, SDL_WINDOW_SHOWN);
     gRenderer = SDL_CreateRenderer(gWindow, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
 
-    const char* fontPaths[] = {
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
-        nullptr
-    };
-    for (int i = 0; fontPaths[i]; i++) {
-        gFont = TTF_OpenFont(fontPaths[i], 22);
-        gFontBig = TTF_OpenFont(fontPaths[i], 48);
-        if (gFont) break;
+    // Font is embedded directly in the binary (font_data.h) so text always
+    // renders regardless of what fonts happen to be installed on this
+    // machine - no filesystem paths to guess at all.
+    SDL_RWops* fontRW1 = SDL_RWFromConstMem(bb_font_data, (int)bb_font_data_len);
+    gFont = TTF_OpenFontRW(fontRW1, 1 /*freesrc*/, 22);
+    SDL_RWops* fontRW2 = SDL_RWFromConstMem(bb_font_data, (int)bb_font_data_len);
+    gFontBig = TTF_OpenFontRW(fontRW2, 1 /*freesrc*/, 48);
+    if (!gFont || !gFontBig) {
+        SDL_Log("WARNING: embedded font failed to load (%s). Text will not render.",
+                TTF_GetError());
     }
 
     SDL_AudioSpec want{};
@@ -296,7 +298,7 @@ int main(int argc, char** argv) {
         flamePhase += dt;
 
         if (!gameOver) {
-            float gravity = 620.f + level * 14.f;
+            float gravity = 620.f;
             float groundLevel = (float)GROUND_Y - 20;   // true ground height (used for misses)
             float catchY = (float)GROUND_Y - 42;         // height of the stretcher surface (used for catches)
 
@@ -320,7 +322,7 @@ int main(int argc, char** argv) {
                 babies.push_back(b);
             }
 
-            spawnInterval = std::max(1.1f, 3.2f - (level - 1) * 0.12f);
+            spawnInterval = std::max(0.55f, 3.2f - (level - 1) * 0.22f);
 
             for (auto& b : babies) {
                 if (b.state == BabyState::Falling) {
@@ -404,7 +406,7 @@ int main(int argc, char** argv) {
             babies.erase(std::remove_if(babies.begin(), babies.end(),
                 [](const Baby& b) { return b.state == BabyState::Gone; }), babies.end());
 
-            level = 1 + score / 150;
+            level = 1 + score / 80;
         }
 
         // ---- render ----
@@ -426,10 +428,19 @@ int main(int argc, char** argv) {
         drawFirefighters(ff);
 
         SDL_Color white{ 255, 255, 255, 255 };
-        drawText("Score: " + std::to_string(score), 20, 15, white, gFont);
-        drawText("Lives: " + std::to_string(std::max(0, lives)), 20, 45, white, gFont);
-        drawText("Level: " + std::to_string(level), SCREEN_W - 140, 15, white, gFont);
+        drawText("Lives: " + std::to_string(std::max(0, lives)), 20, 15, white, gFont);
+        drawText("Level: " + std::to_string(level), 20, 45, white, gFont);
         drawText("Keys: 1=Near bldg 2=Mid 3=Near ambulance", SCREEN_W/2, 15, white, gFont, true);
+
+        // big score text, top right (no box/border)
+        {
+            int areaW = 210;
+            int x = SCREEN_W - areaW - 15;
+            int y = 15;
+            SDL_Color label{ 200, 200, 210, 255 };
+            drawText("SCORE", x + areaW/2, y, label, gFont, true);
+            drawText(std::to_string(score), x + areaW/2, y + 24, white, gFontBig, true);
+        }
 
         if (gameOver) {
             SDL_Color overlay{ 0, 0, 0, 180 };
