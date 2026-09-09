@@ -16,6 +16,8 @@
 #include <ctime>
 #include <string>
 #include <algorithm>
+#include <fstream>
+#include <sstream>
 
 static const int SCREEN_W = 800;
 static const int SCREEN_H = 600;
@@ -124,6 +126,68 @@ void drawText(const std::string& s, int x, int y, SDL_Color c, TTF_Font* font, b
     SDL_RenderCopy(gRenderer, tex, nullptr, &dst);
     SDL_FreeSurface(surf);
     SDL_DestroyTexture(tex);
+}
+
+// ---- High scores ----
+// Persisted as plain text under the OS's normal per-user data directory via
+// SDL_GetPrefPath, which resolves to the right place on each platform on its
+// own (e.g. ~/.local/share/BouncingBabies/ on Linux, %APPDATA%\BouncingBabies\
+// on Windows, ~/Library/Application Support/BouncingBabies/ on macOS) so
+// there's no manual HOME/APPDATA guessing here. Each entry is written as two
+// lines (score, then name) rather than one delimited line, so a name can
+// contain spaces or punctuation without needing to escape anything.
+static const int MAX_HIGH_SCORES = 10;
+static const size_t MAX_NAME_LEN = 16;
+
+struct HighScoreEntry {
+    std::string name;
+    int score;
+};
+static std::vector<HighScoreEntry> gHighScores;
+
+std::string highScoreFilePath() {
+    char* pref = SDL_GetPrefPath("", "BouncingBabies");
+    std::string path = pref ? (std::string(pref) + "highscores.txt") : "highscores.txt";
+    if (pref) SDL_free(pref);
+    return path;
+}
+
+void sortAndTrimHighScores() {
+    std::sort(gHighScores.begin(), gHighScores.end(),
+        [](const HighScoreEntry& a, const HighScoreEntry& b) { return a.score > b.score; });
+    if (gHighScores.size() > (size_t)MAX_HIGH_SCORES) gHighScores.resize(MAX_HIGH_SCORES);
+}
+
+void loadHighScores() {
+    gHighScores.clear();
+    std::ifstream in(highScoreFilePath());
+    std::string scoreLine, nameLine;
+    while (std::getline(in, scoreLine) && std::getline(in, nameLine)) {
+        try {
+            gHighScores.push_back({ nameLine, std::stoi(scoreLine) });
+        } catch (...) { /* skip a malformed/corrupted entry rather than crash */ }
+    }
+    sortAndTrimHighScores();
+}
+
+void saveHighScores() {
+    std::ofstream out(highScoreFilePath(), std::ios::trunc);
+    for (const auto& e : gHighScores) out << e.score << "\n" << e.name << "\n";
+}
+
+// True if `score` would land somewhere in the top MAX_HIGH_SCORES - used to
+// decide whether the player is prompted to enter their name at all.
+bool qualifiesForHighScore(int score) {
+    if (gHighScores.size() < (size_t)MAX_HIGH_SCORES) return true;
+    return score > gHighScores.back().score;
+}
+
+// Inserts a name/score pair in sorted position and re-saves the file.
+void addHighScore(const std::string& name, int score) {
+    std::string displayName = name.empty() ? "Player" : name;
+    gHighScores.push_back({ displayName, score });
+    sortAndTrimHighScores();
+    saveHighScores();
 }
 
 // One flickering flame "tongue": a stack of narrowing, wobbling rows that
@@ -289,6 +353,7 @@ void launchBounce(Baby& b, int fromZone, int toZone, float vy0, float gravity) {
 
 int main(int argc, char** argv) {
     srand((unsigned)time(nullptr));
+    loadHighScores();
 
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_AUDIO | SDL_INIT_JOYSTICK | SDL_INIT_GAMECONTROLLER) != 0) {
         SDL_Log("SDL_Init failed: %s", SDL_GetError());
@@ -356,6 +421,10 @@ int main(int argc, char** argv) {
     bool running = true;
     bool isFullscreen = false;
     bool introScreen = true;
+    bool showHighScores = false;   // toggled with H, only reachable from intro/game-over
+    bool highScoreResolved = false; // guards against re-checking the same game-over score every frame
+    bool enteringName = false;      // true while the new-high-score name prompt is up
+    std::string nameInput;
 
     Uint32 lastTicks = SDL_GetTicks();
 
@@ -365,7 +434,7 @@ int main(int argc, char** argv) {
     auto doConfirm = [&]() {
         if (introScreen) {
             introScreen = false;
-        } else if (gameOver) {
+        } else if (gameOver && !enteringName) {
             babies.clear();
             score = 0;
             lives = 5;
@@ -373,6 +442,7 @@ int main(int argc, char** argv) {
             spawnInterval = 3.2f;
             doubleSpawnTimer = -1.f;
             gameOver = false;
+            highScoreResolved = false;
         }
     };
     auto doCycle = [&](int dir) { // dir: -1 = left, +1 = right
@@ -395,10 +465,40 @@ int main(int argc, char** argv) {
         SDL_Event e;
         while (SDL_PollEvent(&e)) {
             if (e.type == SDL_QUIT) running = false;
+
+            // While the new-high-score name prompt is up, keyboard input goes
+            // there and nowhere else (no pausing/fullscreen/movement/restart).
+            if (enteringName) {
+                if (e.type == SDL_TEXTINPUT) {
+                    if (nameInput.size() < MAX_NAME_LEN) nameInput += e.text.text;
+                } else if (e.type == SDL_KEYDOWN) {
+                    SDL_Keycode k = e.key.keysym.sym;
+                    if (k == SDLK_BACKSPACE && !nameInput.empty()) {
+                        nameInput.pop_back();
+                    } else if (k == SDLK_RETURN || k == SDLK_KP_ENTER) {
+                        addHighScore(nameInput, score);
+                        enteringName = false;
+                        SDL_StopTextInput();
+                    } else if (k == SDLK_ESCAPE) {
+                        // skip saving a name rather than force one
+                        enteringName = false;
+                        SDL_StopTextInput();
+                    }
+                }
+                continue;
+            }
+
             if (e.type == SDL_KEYDOWN) {
                 SDL_Keycode k = e.key.keysym.sym;
-                if (k == SDLK_ESCAPE) running = false;
-                if (k == SDLK_F11) {
+                if (k == SDLK_ESCAPE) {
+                    if (showHighScores) showHighScores = false; // close the high-score screen instead of quitting
+                    else running = false;
+                } else if (k == SDLK_h && (introScreen || gameOver)) {
+                    showHighScores = !showHighScores;
+                } else if (showHighScores) {
+                    // any other key just closes the high-score screen
+                    showHighScores = false;
+                } else if (k == SDLK_F11) {
                     isFullscreen = !isFullscreen;
                     SDL_SetWindowFullscreen(gWindow, isFullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
                 } else if (k == SDLK_LEFT)  doCycle(-1);
@@ -409,7 +509,9 @@ int main(int argc, char** argv) {
                 else if (k == SDLK_RETURN) doConfirm();
                 else if (introScreen && k != SDLK_ESCAPE) doConfirm(); // any other key on the intro screen starts the game
             } else if (e.type == SDL_MOUSEBUTTONDOWN && e.button.button == SDL_BUTTON_LEFT) {
-                if (introScreen || gameOver) {
+                if (showHighScores) {
+                    showHighScores = false;
+                } else if (introScreen || gameOver) {
                     doConfirm();
                 } else {
                     float lx, ly;
@@ -459,6 +561,34 @@ int main(int argc, char** argv) {
             }
         }
 
+        if (showHighScores) {
+            SDL_SetRenderDrawColor(gRenderer, 15, 15, 30, 255);
+            SDL_RenderClear(gRenderer);
+
+            SDL_Color gold{ 230, 210, 60, 255 };
+            SDL_Color white{ 255, 255, 255, 255 };
+            SDL_Color dim{ 180, 180, 190, 255 };
+
+            drawText("HIGH SCORES", SCREEN_W/2, 70, gold, gFontBig, true);
+
+            int listY = 160;
+            if (gHighScores.empty()) {
+                drawText("No scores yet - go catch some babies!", SCREEN_W/2, listY, dim, gFont, true);
+            } else {
+                for (size_t i = 0; i < gHighScores.size(); i++) {
+                    std::string rank = std::to_string(i + 1) + ".";
+                    SDL_Color rowColor = (i == 0) ? gold : white;
+                    drawText(rank + "  " + gHighScores[i].name, SCREEN_W/2 - 220, listY, rowColor, gFont);
+                    drawText(std::to_string(gHighScores[i].score), SCREEN_W/2 + 220, listY, rowColor, gFont, true);
+                    listY += 34;
+                }
+            }
+
+            drawText("Press H, ESC, or any key to go back", SCREEN_W/2, SCREEN_H - 60, dim, gFont, true);
+            SDL_RenderPresent(gRenderer);
+            continue;
+        }
+
         if (introScreen) {
             SDL_SetRenderDrawColor(gRenderer, 15, 15, 30, 255);
             SDL_RenderClear(gRenderer);
@@ -492,7 +622,7 @@ int main(int argc, char** argv) {
             drawText("LEFT / RIGHT arrows - move between zones", SCREEN_W/2, SCREEN_H/2 - 20, white, gFont, true);
             drawText("1 / 2 / 3 - jump straight to a zone", SCREEN_W/2, SCREEN_H/2 + 10, white, gFont, true);
             drawText("Click a zone, or use a controller's stick/D-pad", SCREEN_W/2, SCREEN_H/2 + 40, white, gFont, true);
-            drawText("F11 - toggle fullscreen        ESC - quit", SCREEN_W/2, SCREEN_H/2 + 70, white, gFont, true);
+            drawText("F11 - toggle fullscreen        ESC - quit        H - high scores", SCREEN_W/2, SCREEN_H/2 + 70, white, gFont, true);
             drawText("Press any key, click, or press a button to start", SCREEN_W/2, SCREEN_H/2 + 120, gold, gFont, true);
             SDL_RenderPresent(gRenderer);
             continue;
@@ -635,6 +765,15 @@ int main(int argc, char** argv) {
             level = 1 + score / 80;
         }
 
+        if (gameOver && !highScoreResolved) {
+            highScoreResolved = true;
+            if (qualifiesForHighScore(score)) {
+                enteringName = true;
+                nameInput.clear();
+                SDL_StartTextInput();
+            }
+        }
+
         // ---- render ----
         SDL_SetRenderDrawColor(gRenderer, 15, 15, 30, 255);
         SDL_RenderClear(gRenderer);
@@ -672,7 +811,30 @@ int main(int argc, char** argv) {
             fillRect(0, 0, SCREEN_W, SCREEN_H, overlay);
             drawText("GAME OVER", SCREEN_W/2, SCREEN_H/2 - 60, white, gFontBig, true);
             drawText("Final Score: " + std::to_string(score), SCREEN_W/2, SCREEN_H/2, white, gFont, true);
-            drawText("Press ENTER to restart", SCREEN_W/2, SCREEN_H/2 + 40, white, gFont, true);
+
+            if (enteringName) {
+                SDL_Color gold{ 230, 210, 60, 255 };
+                drawText("NEW HIGH SCORE! Enter your name:", SCREEN_W/2, SCREEN_H/2 + 40, gold, gFont, true);
+
+                // Blinking cursor, ~2Hz, appended only while it's "on".
+                std::string shown = nameInput;
+                if ((SDL_GetTicks() / 250) % 2 == 0) shown += "_";
+
+                int boxW = 300, boxH = 40;
+                SDL_Color boxColor{ 30, 30, 45, 230 };
+                SDL_Color boxBorder{ 230, 210, 60, 255 };
+                int boxX = SCREEN_W/2 - boxW/2, boxY = SCREEN_H/2 + 70;
+                fillRect(boxX, boxY, boxW, boxH, boxColor);
+                fillRect(boxX, boxY, boxW, 2, boxBorder);
+                fillRect(boxX, boxY + boxH - 2, boxW, 2, boxBorder);
+                fillRect(boxX, boxY, 2, boxH, boxBorder);
+                fillRect(boxX + boxW - 2, boxY, 2, boxH, boxBorder);
+                drawText(shown, SCREEN_W/2, boxY + 9, white, gFont, true);
+
+                drawText("ENTER to confirm        ESC to skip", SCREEN_W/2, boxY + boxH + 20, white, gFont, true);
+            } else {
+                drawText("Press ENTER to restart        H - high scores", SCREEN_W/2, SCREEN_H/2 + 40, white, gFont, true);
+            }
         }
 
         SDL_RenderPresent(gRenderer);
