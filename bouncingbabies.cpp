@@ -412,7 +412,7 @@ int main(int argc, char** argv) {
     std::vector<Baby> babies;
 
     int score = 0;
-    int lives = 5;
+    int lives = 7;
     int level = 1;
     float spawnTimer = 0.f;
     float spawnInterval = 3.2f;
@@ -438,7 +438,7 @@ int main(int argc, char** argv) {
         } else if (gameOver && !enteringName) {
             babies.clear();
             score = 0;
-            lives = 5;
+            lives = 7;
             level = 1;
             spawnInterval = 3.2f;
             doubleSpawnTimer = -1.f;
@@ -662,10 +662,10 @@ int main(int argc, char** argv) {
                 // first, ramping up in both frequency and how tight the
                 // gap is as the level climbs, so late levels demand
                 // catching two in a row instead of one at a time.
-                if (level >= 4) {
-                    float doubleChance = std::min(0.85f, (level - 3) * 0.15f);
+                if (level >= 6) {
+                    float doubleChance = std::min(0.5f, (level - 5) * 0.08f);
                     if ((float)rand() / (float)RAND_MAX < doubleChance) {
-                        float gap = std::max(0.10f, 0.25f - (level - 4) * 0.02f);
+                        float gap = std::max(0.20f, 0.30f - (level - 6) * 0.015f);
                         doubleSpawnTimer = gap;
                     }
                 }
@@ -679,7 +679,7 @@ int main(int argc, char** argv) {
                 }
             }
 
-            spawnInterval = std::max(0.55f, 3.2f - (level - 1) * 0.22f);
+            spawnInterval = std::max(0.85f, 3.6f - (level - 1) * 0.15f);
 
             for (auto& b : babies) {
                 if (b.state == BabyState::Falling) {
@@ -763,7 +763,7 @@ int main(int argc, char** argv) {
             babies.erase(std::remove_if(babies.begin(), babies.end(),
                 [](const Baby& b) { return b.state == BabyState::Gone; }), babies.end());
 
-            level = 1 + score / 80;
+            level = 1 + score / 150;
         }
 
         if (gameOver && !highScoreResolved) {
