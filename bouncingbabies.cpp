@@ -292,6 +292,11 @@ void fillCircle(int cx, int cy, int r, SDL_Color c) {
 
 void drawBaby(const Baby& b) {
     if (b.state == BabyState::Gone) return;
+    // Once the final hop/delivery arc carries the baby's x past the
+    // ambulance's front edge, it's conceptually "inside" the vehicle -
+    // stop drawing it so it doesn't visibly overlap/clip through the
+    // ambulance body (roof, stripe, cross) while still airborne.
+    if (b.x >= (float)AMBULANCE_X) return;
     SDL_Color skin{ 250, 210, 170, 255 };
     SDL_Color diaper{ 250, 250, 250, 255 };
     SDL_Color face{ 60, 40, 30, 255 };
@@ -635,7 +640,15 @@ int main(int argc, char** argv) {
             float catchY = (float)GROUND_Y - 42;         // height of the stretcher surface (used for catches)
 
             auto spawnOneBaby = [&]() {
-                int row = 0; // topmost window = the 4th floor
+                // Early on, babies only come from the top (4th floor)
+                // window. Higher levels start mixing in the 3rd floor
+                // window, then the 2nd floor too, for extra unpredictability.
+                int row = 0;
+                if (level >= 8) {
+                    row = rand() % 3;      // top, 3rd, or 2nd floor
+                } else if (level >= 5) {
+                    row = rand() % 2;      // top or 3rd floor
+                }
                 Baby b;
                 b.x = (float)WINDOW_X + 23.f;   // start inside the window
                 b.y = (float)WINDOW_Y[row] + 25;
