@@ -7,7 +7,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 find_package(SDL2 CONFIG REQUIRED)
 find_package(SDL2_ttf CONFIG REQUIRED)
 
-add_executable(bouncingbabies WIN32 bouncingbabies.cpp)
+add_executable(bouncingbabies WIN32 bouncingbabies.cpp dbopl.cpp  dbopl_wrapper.cpp  instruments.cpp  midi_render.cpp)
 
 
 target_link_libraries(bouncingbabies PRIVATE

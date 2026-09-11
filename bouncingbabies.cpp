@@ -20,6 +20,11 @@
 #include <fstream>
 #include <sstream>
 
+// MIDI-rendered music/SFX (OPL3 synth, rendered to PCM once at startup).
+#include "midi_render.h"
+#include "music_gladiators_mid.h"
+#include "sfx_levelup_mid.h"
+
 static const int SCREEN_W = 800;
 static const int SCREEN_H = 600;
 static const int GROUND_Y = 520;
@@ -57,6 +62,53 @@ static TTF_Font* gFontBig = nullptr;
 
 static SDL_AudioDeviceID gAudioDev = 0;
 static SDL_AudioSpec gAudioSpec;
+
+// Separate device dedicated to looping background music, so it plays
+// continuously without being interrupted by short SFX queued on gAudioDev
+// (SDL_QueueAudio is a strict FIFO per device - two sounds sharing one
+// device play back-to-back, not layered, so music needs its own stream).
+static SDL_AudioDeviceID gMusicDev = 0;
+static SDL_AudioSpec gMusicSpec;
+static std::vector<Sint16> gMusicPCM;   // "Entry of the Gladiators", mono 16-bit
+static size_t gMusicPos = 0;            // playback position for manual looping
+
+static std::vector<Sint16> gLevelUpPCM; // level-up jingle, mono 16-bit
+
+// Renders an embedded MIDI asset (OPL3 synth) to mono 16-bit PCM at 44100Hz,
+// matching the game's existing audio device format.
+static std::vector<Sint16> renderMidiToMonoPCM(const unsigned char* midiBytes, unsigned int len) {
+    std::vector<uint8_t> midi(midiBytes, midiBytes + len);
+    std::vector<uint8_t> wav;
+    if (!render_midi_to_wav(midi, wav, 500) || wav.size() < 44) return {};
+
+    const Sint16* stereo = reinterpret_cast<const Sint16*>(wav.data() + 44);
+    size_t frames = (wav.size() - 44) / (2 * sizeof(Sint16));
+
+    std::vector<Sint16> mono(frames);
+    for (size_t i = 0; i < frames; i++) {
+        int32_t l = stereo[i * 2];
+        int32_t r = stereo[i * 2 + 1];
+        mono[i] = (Sint16)((l + r) / 2);
+    }
+    return mono;
+}
+
+// Tops off the music queue when it's running low, looping back to the
+// start of the track. Call once per frame from the main loop.
+static void updateMusicStream() {
+    if (gMusicDev == 0 || gMusicPCM.empty()) return;
+
+    const Uint32 lowWaterBytes = gMusicSpec.freq * sizeof(Sint16) / 2; // ~0.5s
+    const size_t chunkFrames = gMusicSpec.freq;                        // ~1s per top-off
+
+    while (SDL_GetQueuedAudioSize(gMusicDev) < lowWaterBytes) {
+        size_t remaining = gMusicPCM.size() - gMusicPos;
+        size_t n = std::min(chunkFrames, remaining);
+        SDL_QueueAudio(gMusicDev, gMusicPCM.data() + gMusicPos, (Uint32)(n * sizeof(Sint16)));
+        gMusicPos += n;
+        if (gMusicPos >= gMusicPCM.size()) gMusicPos = 0; // loop
+    }
+}
 
 // Current oversampling factor the loaded fonts were rendered at. When the
 // window is bigger than the logical SCREEN_W x SCREEN_H canvas, we reload
@@ -101,6 +153,11 @@ void playBoing()   { playTone(300, 500, 0.10f); }
 void playSplat()   { playTone(180, 60, 0.30f, 0.35f); }
 void playDeliver() { playTone(500, 900, 0.15f, 0.2f); }
 void playGameOver(){ playTone(400, 100, 0.8f, 0.3f); }
+
+void playLevelUp() {
+    if (gAudioDev == 0 || gLevelUpPCM.empty()) return;
+    SDL_QueueAudio(gAudioDev, gLevelUpPCM.data(), (Uint32)(gLevelUpPCM.size() * sizeof(Sint16)));
+}
 
 void fillRect(int x, int y, int w, int h, SDL_Color c) {
     SDL_SetRenderDrawColor(gRenderer, c.r, c.g, c.b, c.a);
@@ -397,6 +454,23 @@ int main(int argc, char** argv) {
     gAudioDev = SDL_OpenAudioDevice(nullptr, 0, &want, &gAudioSpec, 0);
     if (gAudioDev) SDL_PauseAudioDevice(gAudioDev, 0);
 
+    // Second device dedicated to background music - see the comment by
+    // gMusicDev's declaration for why this needs to be separate from
+    // gAudioDev's SFX queue.
+    SDL_AudioSpec wantMusic{};
+    wantMusic.freq = 44100;
+    wantMusic.format = AUDIO_S16SYS;
+    wantMusic.channels = 1;
+    wantMusic.samples = 2048;
+    gMusicDev = SDL_OpenAudioDevice(nullptr, 0, &wantMusic, &gMusicSpec, 0);
+    if (gMusicDev) SDL_PauseAudioDevice(gMusicDev, 0);
+
+    // Render the embedded MIDI assets (OPL3 synth) to PCM once, up front.
+    // Fast (well under a second for the full ~3 minute track) so it's done
+    // synchronously here rather than in a background thread.
+    gMusicPCM = renderMidiToMonoPCM(bb_music_gladiators_mid, bb_music_gladiators_mid_len);
+    gLevelUpPCM = renderMidiToMonoPCM(bb_sfx_levelup_mid, bb_sfx_levelup_mid_len);
+
     // Optional joystick/gamepad: opens the first one plugged in, if any.
     // Uses the plain SDL_Joystick API (axis 0 = horizontal stick/d-pad,
     // any button = confirm) rather than the SDL_GameController mapping
@@ -499,7 +573,7 @@ int main(int argc, char** argv) {
                 SDL_Keycode k = e.key.keysym.sym;
                 if (k == SDLK_ESCAPE) {
                     if (showHighScores) showHighScores = false;      // close the high-score screen instead of quitting
-                    else if (paused) paused = false;                  // unpause instead of quitting
+                    else if (paused) { paused = false; if (gMusicDev) SDL_PauseAudioDevice(gMusicDev, 0); } // unpause instead of quitting
                     else running = false;
                 } else if (k == SDLK_h && (introScreen || gameOver)) {
                     showHighScores = !showHighScores;
@@ -508,6 +582,7 @@ int main(int argc, char** argv) {
                     showHighScores = false;
                 } else if (k == SDLK_p && !introScreen && !gameOver) {
                     paused = !paused;
+                    if (gMusicDev) SDL_PauseAudioDevice(gMusicDev, paused ? 1 : 0);
                 } else if (k == SDLK_F11) {
                     isFullscreen = !isFullscreen;
                     SDL_SetWindowFullscreen(gWindow, isFullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
@@ -552,6 +627,8 @@ int main(int argc, char** argv) {
                 joyAxisDir = dir;
             }
         }
+
+        updateMusicStream();
 
         ff.x = (float)ZONE_X[ff.zone];
         flamePhase += dt;
@@ -780,7 +857,9 @@ int main(int argc, char** argv) {
             babies.erase(std::remove_if(babies.begin(), babies.end(),
                 [](const Baby& b) { return b.state == BabyState::Gone; }), babies.end());
 
+            int prevLevel = level;
             level = 1 + score / 150;
+            if (level > prevLevel) playLevelUp();
         }
 
         if (gameOver && !highScoreResolved) {
@@ -866,6 +945,7 @@ int main(int argc, char** argv) {
     }
 
     if (gAudioDev) SDL_CloseAudioDevice(gAudioDev);
+    if (gMusicDev) SDL_CloseAudioDevice(gMusicDev);
     if (gJoystick) SDL_JoystickClose(gJoystick);
     if (gFont) TTF_CloseFont(gFont);
     if (gFontBig) TTF_CloseFont(gFontBig);
