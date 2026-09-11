@@ -95,6 +95,95 @@ static std::vector<Sint16> renderMidiToMonoPCM(const unsigned char* midiBytes, u
     return mono;
 }
 
+// ---- PCM disk cache ----
+// Rendering "Entry of the Gladiators" through the OPL3 synth takes under a
+// second, but that's still work done on every single startup for no reason
+// once it's been rendered once. Cache the resulting PCM next to the high
+// scores/music-pref files; a simple FNV-1a hash of the source MIDI bytes
+// acts as the cache key, so if the embedded track is ever swapped out the
+// stale cache is detected and silently discarded/re-rendered rather than
+// playing the wrong audio.
+static uint32_t fnv1aHash(const unsigned char* data, size_t len) {
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < len; i++) { h ^= data[i]; h *= 16777619u; }
+    return h;
+}
+
+static const uint32_t PCM_CACHE_MAGIC = 0x42425043; // "BBPC"
+static const uint32_t PCM_CACHE_VERSION = 2; // bumped: level-up SFX is now peak-normalized
+
+// Scales PCM up so its peak sample hits targetPeak (default ~92% of full
+// scale, leaving a little headroom) - never scales down, so an
+// already-loud asset (like the music) is left alone if this is applied to
+// it. Short one-shot SFX like the level-up jingle tend to render quiet
+// (a single low-velocity voice vs. a full mixed track), so this is what
+// actually fixes that rather than just cranking a global volume knob,
+// which would just clip instead of getting louder.
+static void normalizePeak(std::vector<Sint16>& pcm, float targetPeak = 0.92f) {
+    if (pcm.empty()) return;
+    int32_t peak = 0;
+    for (Sint16 s : pcm) peak = std::max(peak, (int32_t)std::abs((int)s));
+    if (peak == 0) return;
+    float gain = (targetPeak * 32767.f) / (float)peak;
+    if (gain <= 1.f) return; // already loud enough; don't attenuate
+    for (Sint16& s : pcm) {
+        int32_t v = (int32_t)std::lround(s * gain);
+        s = (Sint16)std::clamp(v, -32768, 32767);
+    }
+}
+
+static std::string cacheFilePath(const std::string& fileName) {
+    char* pref = SDL_GetPrefPath("", "BouncingBabies");
+    std::string path = pref ? (std::string(pref) + fileName) : fileName;
+    if (pref) SDL_free(pref);
+    return path;
+}
+
+static bool loadPCMCache(const std::string& path, uint32_t expectedHash, std::vector<Sint16>& out) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return false;
+    uint32_t magic = 0, version = 0, hash = 0;
+    uint64_t count = 0;
+    in.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+    in.read(reinterpret_cast<char*>(&version), sizeof(version));
+    in.read(reinterpret_cast<char*>(&hash), sizeof(hash));
+    in.read(reinterpret_cast<char*>(&count), sizeof(count));
+    if (!in || magic != PCM_CACHE_MAGIC || version != PCM_CACHE_VERSION || hash != expectedHash) return false;
+
+    out.resize((size_t)count);
+    in.read(reinterpret_cast<char*>(out.data()), (std::streamsize)(count * sizeof(Sint16)));
+    if (!in) { out.clear(); return false; }
+    return true;
+}
+
+static void savePCMCache(const std::string& path, uint32_t hash, const std::vector<Sint16>& pcm) {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) return; // non-fatal: worst case, next startup just renders again
+    uint32_t magic = PCM_CACHE_MAGIC, version = PCM_CACHE_VERSION;
+    uint64_t count = pcm.size();
+    out.write(reinterpret_cast<const char*>(&magic), sizeof(magic));
+    out.write(reinterpret_cast<const char*>(&version), sizeof(version));
+    out.write(reinterpret_cast<const char*>(&hash), sizeof(hash));
+    out.write(reinterpret_cast<const char*>(&count), sizeof(count));
+    out.write(reinterpret_cast<const char*>(pcm.data()), (std::streamsize)(count * sizeof(Sint16)));
+}
+
+// Loads a MIDI asset's rendered PCM from the disk cache if a valid one
+// exists, otherwise renders it fresh and writes the cache for next time.
+static std::vector<Sint16> loadOrRenderMidiAsset(const unsigned char* midiBytes, unsigned int len,
+                                                  const std::string& cacheFileName, bool normalize = false) {
+    uint32_t hash = fnv1aHash(midiBytes, len);
+    std::string path = cacheFilePath(cacheFileName);
+
+    std::vector<Sint16> pcm;
+    if (loadPCMCache(path, hash, pcm)) return pcm;
+
+    pcm = renderMidiToMonoPCM(midiBytes, len);
+    if (normalize) normalizePeak(pcm);
+    savePCMCache(path, hash, pcm);
+    return pcm;
+}
+
 // Tops off the music queue when it's running low, looping back to the
 // start of the track. Call once per frame from the main loop.
 static void updateMusicStream() {
@@ -515,11 +604,12 @@ int main(int argc, char** argv) {
 
     gMusicMuted = loadMusicMuted();
 
-    // Render the embedded MIDI assets (OPL3 synth) to PCM once, up front.
-    // Fast (well under a second for the full ~3 minute track) so it's done
-    // synchronously here rather than in a background thread.
-    gMusicPCM = renderMidiToMonoPCM(bb_music_gladiators_mid, bb_music_gladiators_mid_len);
-    gLevelUpPCM = renderMidiToMonoPCM(bb_sfx_levelup_mid, bb_sfx_levelup_mid_len);
+    // Render the embedded MIDI assets (OPL3 synth) to PCM once, up front -
+    // or load them from the disk cache (see loadOrRenderMidiAsset) if a
+    // prior run already rendered and cached them, which skips the synth
+    // entirely and cuts this down to a fast file read.
+    gMusicPCM = loadOrRenderMidiAsset(bb_music_gladiators_mid, bb_music_gladiators_mid_len, "music_cache.bin");
+    gLevelUpPCM = loadOrRenderMidiAsset(bb_sfx_levelup_mid, bb_sfx_levelup_mid_len, "sfx_levelup_cache.bin", /*normalize=*/true);
 
     // Optional joystick/gamepad: opens the first one plugged in, if any.
     // Uses the plain SDL_Joystick API (axis 0 = horizontal stick/d-pad,
@@ -543,6 +633,7 @@ int main(int argc, char** argv) {
     int score = 0;
     int lives = 7;
     int level = 1;
+    float levelUpBannerTimer = 0.f; // >0 while the "LEVEL X!" banner is showing
     float spawnTimer = 0.f;
     float spawnInterval = 3.2f;
     float doubleSpawnTimer = -1.f; // >=0 while counting down to a level-4+ "double throw" second baby
@@ -574,6 +665,7 @@ int main(int argc, char** argv) {
             score = 0;
             lives = 7;
             level = 1;
+            levelUpBannerTimer = 0.f;
             spawnInterval = 3.2f;
             doubleSpawnTimer = -1.f;
             gameOver = false;
@@ -928,8 +1020,15 @@ int main(int argc, char** argv) {
                 [](const Baby& b) { return b.state == BabyState::Gone; }), babies.end());
 
             int prevLevel = level;
-            level = 1 + score / 150;
-            if (level > prevLevel) playLevelUp();
+            // Threshold grows with level^2 rather than staying flat, to
+            // offset score-per-catch also scaling with level (line above:
+            // "score += 10 * level"). With a flat threshold, catches
+            // needed to level up shrinks as ~15/level - levels run
+            // together fast at high level. Squaring the threshold keeps
+            // catches-per-level roughly constant instead.
+            level = 1 + (int)std::sqrt((double)score / 40.0);
+            if (level > prevLevel) { playLevelUp(); levelUpBannerTimer = 1.8f; }
+            if (levelUpBannerTimer > 0.f) levelUpBannerTimer -= dt;
         }
 
         if (gameOver && !highScoreResolved) {
@@ -971,6 +1070,26 @@ int main(int argc, char** argv) {
             SDL_Color label{ 200, 200, 210, 255 };
             drawText("SCORE", x + areaW/2, y, label, gFont, true);
             drawText(std::to_string(score), x + areaW/2, y + 24, white, gFontBig, true);
+        }
+
+        // "LEVEL X!" banner - pops in, holds, then fades out over the
+        // 1.8s window set when levelUpBannerTimer is (re)started.
+        if (levelUpBannerTimer > 0.f) {
+            const float totalDur = 1.8f, fadeInDur = 0.15f, fadeOutDur = 0.5f;
+            float elapsed = totalDur - levelUpBannerTimer;
+            float alphaF;
+            if (elapsed < fadeInDur) alphaF = elapsed / fadeInDur;
+            else if (levelUpBannerTimer < fadeOutDur) alphaF = levelUpBannerTimer / fadeOutDur;
+            else alphaF = 1.f;
+            alphaF = std::clamp(alphaF, 0.f, 1.f);
+
+            int slideOffset = (int)((1.f - std::min(1.f, elapsed / fadeInDur)) * 20.f);
+            SDL_Color gold{ 230, 210, 60, (Uint8)(alphaF * 255) };
+            SDL_Color shadow{ 0, 0, 0, (Uint8)(alphaF * 160) };
+            int bx = SCREEN_W / 2, by = 90 + slideOffset;
+            std::string bannerText = "LEVEL " + std::to_string(level) + "!";
+            drawText(bannerText, bx + 2, by + 2, shadow, gFontBig, true);
+            drawText(bannerText, bx, by, gold, gFontBig, true);
         }
 
         if (paused) {
