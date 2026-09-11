@@ -55,6 +55,23 @@ struct Firefighters {
     float x, y;
 };
 
+// Brief visual feedback for a successful catch: an expanding, fading ring
+// at the catch point. Purely cosmetic, no gameplay effect.
+static const float CATCH_POP_DUR = 0.4f;
+struct CatchPop {
+    float x, y;
+    float timer = 0.f; // counts up from 0; pop is removed once it passes its duration
+};
+
+// Floating "+N" score text shown when a baby is actually delivered (the
+// only moment score changes), rising and fading over its lifetime.
+static const float SCORE_POPUP_DUR = 0.9f;
+struct ScorePopup {
+    std::string text;
+    float x, y;
+    float timer = 0.f;
+};
+
 static SDL_Window* gWindow = nullptr;
 static SDL_Renderer* gRenderer = nullptr;
 static TTF_Font* gFont = nullptr;
@@ -70,6 +87,18 @@ static SDL_AudioSpec gAudioSpec;
 static SDL_AudioDeviceID gMusicDev = 0;
 static SDL_AudioSpec gMusicSpec;
 static bool gMusicMuted = false;        // persisted preference, toggled with M
+static bool gSfxMuted = false;          // persisted preference, toggled with S - mutes SFX (boing/splat/deliver/level-up/game-over)
+static float gMusicVolume = 1.0f;       // persisted preference, 0.0-1.0 in 10% steps, adjusted with [ / ]
+static float gSfxVolume = 1.0f;         // persisted preference, 0.0-1.0 in 10% steps, adjusted with , / .
+
+// The Music/SFX volume line and "Now playing" line are only shown for a
+// few seconds after something actually changes (a mute/volume key, a
+// track skip/advance, or a round starting) - like a volume-overlay toast,
+// rather than sitting on screen permanently. Reset to 0 wherever one of
+// those changes happens; ticks up once per frame in the main loop.
+static float gHudStatusIdleTimer = 0.f;
+static const float HUD_STATUS_HOLD_SEC = 3.0f; // fully visible for this long after a change
+static const float HUD_STATUS_FADE_SEC = 0.6f; // then fades out over this long
 static bool gMusicActive = false;       // true only while a round is actually in progress
 
 // One rendered PCM buffer per entry in kMusicTracks (generated/music_tracks.h,
@@ -208,6 +237,14 @@ static std::string sanitizeForFilename(const std::string& s) {
     return out;
 }
 
+// rand() % n can be badly biased for a small n on some C runtimes (notably
+// MSVC's) whose low-order bits are weakly random - exactly the range Fisher-
+// Yates needs here (n==2 for a two-track library). Scaling down from the
+// full [0, RAND_MAX] range instead draws on the higher-quality bits.
+static int uniformRandBelow(int n) {
+    return (int)(((double)rand() / ((double)RAND_MAX + 1.0)) * n);
+}
+
 // Builds a freshly-shuffled play order across all of kMusicTracks. If
 // avoidFirstIdx is a valid track index and there's more than one track,
 // makes sure the new shuffle doesn't start with that same track - used so
@@ -218,7 +255,7 @@ static void reshufflePlaylist(int avoidFirstIdx) {
     gPlaylist.resize(n);
     for (int i = 0; i < n; i++) gPlaylist[i] = i;
     for (int i = n - 1; i > 0; i--) {
-        int j = rand() % (i + 1);
+        int j = uniformRandBelow(i + 1);
         std::swap(gPlaylist[i], gPlaylist[j]);
     }
     if (n > 1 && gPlaylist[0] == avoidFirstIdx) std::swap(gPlaylist[0], gPlaylist[1]);
@@ -235,25 +272,34 @@ static void advanceToNextTrack() {
     if (gPlaylistPos >= gPlaylist.size()) reshufflePlaylist(gLastFinishedTrackIdx);
     gCurrentTrackIdx = gPlaylist[gPlaylistPos];
     gMusicPos = 0;
+    gHudStatusIdleTimer = 0.f; // show "Now playing" again - the track just changed
 }
 
 // Tops off the music queue when it's running low, advancing to the next
 // shuffled track whenever the current one runs out. Call once per frame.
 static void updateMusicStream() {
-    if (!gMusicActive || gMusicMuted) return;
+    if (!gMusicActive || gMusicMuted || gMusicVolume <= 0.f) return;
     if (gMusicDev == 0 || kMusicTrackCount == 0 || gCurrentTrackIdx < 0) return;
 
     const Uint32 lowWaterBytes = gMusicSpec.freq * sizeof(Sint16) / 2; // ~0.5s
     const size_t chunkFrames = gMusicSpec.freq;                        // ~1s per top-off
 
     int safety = kMusicTrackCount + 1; // guards against an all-empty (failed-render) library
+    std::vector<Sint16> scaledChunk;
     while (SDL_GetQueuedAudioSize(gMusicDev) < lowWaterBytes && safety-- > 0) {
         const std::vector<Sint16>& pcm = gTrackPCM[gCurrentTrackIdx];
         if (pcm.empty()) { advanceToNextTrack(); continue; }
 
         size_t remaining = pcm.size() - gMusicPos;
         size_t n = std::min(chunkFrames, remaining);
-        SDL_QueueAudio(gMusicDev, pcm.data() + gMusicPos, (Uint32)(n * sizeof(Sint16)));
+
+        // Scaled at queue time (rather than baked into the cached PCM) so
+        // [ / ] volume changes take effect immediately on the next top-off.
+        scaledChunk.resize(n);
+        for (size_t i = 0; i < n; i++)
+            scaledChunk[i] = (Sint16)std::clamp((int)std::lround(pcm[gMusicPos + i] * gMusicVolume), -32768, 32767);
+        SDL_QueueAudio(gMusicDev, scaledChunk.data(), (Uint32)(n * sizeof(Sint16)));
+
         gMusicPos += n;
         if (gMusicPos >= pcm.size()) advanceToNextTrack();
     }
@@ -278,6 +324,7 @@ static void startMusicPlayback(bool gamePaused) {
     }
     if (gMusicDev) SDL_ClearQueuedAudio(gMusicDev);
     applyMusicDeviceState(gamePaused);
+    gHudStatusIdleTimer = 0.f; // show the status line fresh at the start of a round
 }
 
 // Called the moment lives hit 0.
@@ -311,17 +358,18 @@ void loadFontsAtScale(float scale) {
 }
 
 void playTone(float startFreq, float endFreq, float durationSec, float volume = 0.25f) {
-    if (gAudioDev == 0) return;
+    if (gAudioDev == 0 || gSfxMuted || gSfxVolume <= 0.f) return;
     int sampleRate = gAudioSpec.freq;
     int n = (int)(durationSec * sampleRate);
     std::vector<Sint16> buf(n);
+    float vol = volume * gSfxVolume;
     for (int i = 0; i < n; i++) {
         float tNorm = (float)i / n;
         float freq = startFreq + (endFreq - startFreq) * tNorm;
         float phase = 2.0f * (float)M_PI * freq * ((float)i / sampleRate);
         float sample = std::sin(phase) >= 0 ? 1.0f : -1.0f; // PC-speaker-ish square wave
         float env = 1.0f - tNorm;
-        buf[i] = (Sint16)(sample * volume * 32767 * env);
+        buf[i] = (Sint16)(sample * vol * 32767 * env);
     }
     SDL_QueueAudio(gAudioDev, buf.data(), n * sizeof(Sint16));
 }
@@ -332,8 +380,11 @@ void playDeliver() { playTone(500, 900, 0.15f, 0.2f); }
 void playGameOver(){ playTone(400, 100, 0.8f, 0.3f); }
 
 void playLevelUp() {
-    if (gAudioDev == 0 || gLevelUpPCM.empty()) return;
-    SDL_QueueAudio(gAudioDev, gLevelUpPCM.data(), (Uint32)(gLevelUpPCM.size() * sizeof(Sint16)));
+    if (gAudioDev == 0 || gSfxMuted || gSfxVolume <= 0.f || gLevelUpPCM.empty()) return;
+    std::vector<Sint16> scaled(gLevelUpPCM.size());
+    for (size_t i = 0; i < gLevelUpPCM.size(); i++)
+        scaled[i] = (Sint16)std::clamp((int)std::lround(gLevelUpPCM[i] * gSfxVolume), -32768, 32767);
+    SDL_QueueAudio(gAudioDev, scaled.data(), (Uint32)(scaled.size() * sizeof(Sint16)));
 }
 
 void fillRect(int x, int y, int w, int h, SDL_Color c) {
@@ -387,8 +438,9 @@ std::string highScoreFilePath() {
     return path;
 }
 
-// ---- Music mute preference ----
-// Same pref directory as high scores, one line: "1" (muted) or "0" (unmuted).
+// ---- Music mute/volume preference ----
+// Same pref directory as high scores: line 1 is "1"/"0" (muted/unmuted),
+// line 2 is volume as an integer percent (0-100).
 std::string musicPrefFilePath() {
     char* pref = SDL_GetPrefPath("", "BouncingBabies");
     std::string path = pref ? (std::string(pref) + "musicpref.txt") : "musicpref.txt";
@@ -396,16 +448,37 @@ std::string musicPrefFilePath() {
     return path;
 }
 
-bool loadMusicMuted() {
+void loadMusicPrefs(bool& muted, float& volume) {
     std::ifstream in(musicPrefFilePath());
-    int v = 0;
-    if (in >> v) return v != 0;
-    return false; // default: unmuted
+    int mutedInt = 0, volPercent = 100;
+    muted = (in >> mutedInt) ? (mutedInt != 0) : false;
+    volume = (in >> volPercent) ? std::clamp(volPercent / 100.f, 0.f, 1.f) : 1.0f;
 }
 
-void saveMusicMuted(bool muted) {
+void saveMusicPrefs(bool muted, float volume) {
     std::ofstream out(musicPrefFilePath(), std::ios::trunc);
-    out << (muted ? 1 : 0) << "\n";
+    out << (muted ? 1 : 0) << "\n" << (int)std::lround(volume * 100.f) << "\n";
+}
+
+// ---- SFX mute/volume preference ----
+// Same layout as the music prefs above.
+std::string sfxPrefFilePath() {
+    char* pref = SDL_GetPrefPath("", "BouncingBabies");
+    std::string path = pref ? (std::string(pref) + "sfxpref.txt") : "sfxpref.txt";
+    if (pref) SDL_free(pref);
+    return path;
+}
+
+void loadSfxPrefs(bool& muted, float& volume) {
+    std::ifstream in(sfxPrefFilePath());
+    int mutedInt = 0, volPercent = 100;
+    muted = (in >> mutedInt) ? (mutedInt != 0) : false;
+    volume = (in >> volPercent) ? std::clamp(volPercent / 100.f, 0.f, 1.f) : 1.0f;
+}
+
+void saveSfxPrefs(bool muted, float volume) {
+    std::ofstream out(sfxPrefFilePath(), std::ios::trunc);
+    out << (muted ? 1 : 0) << "\n" << (int)std::lround(volume * 100.f) << "\n";
 }
 
 void sortAndTrimHighScores() {
@@ -663,7 +736,8 @@ int main(int argc, char** argv) {
     gMusicDev = SDL_OpenAudioDevice(nullptr, 0, &wantMusic, &gMusicSpec, 0);
     if (gMusicDev) SDL_PauseAudioDevice(gMusicDev, 1); // stays silent until a round actually starts
 
-    gMusicMuted = loadMusicMuted();
+    loadMusicPrefs(gMusicMuted, gMusicVolume);
+    loadSfxPrefs(gSfxMuted, gSfxVolume);
 
     // Render every embedded MIDI asset (OPL3 synth) to PCM once, up front -
     // or load each from the disk cache (see loadOrRenderMidiAsset) if a
@@ -696,6 +770,8 @@ int main(int argc, char** argv) {
     ff.y = (float)GROUND_Y - 20;
 
     std::vector<Baby> babies;
+    std::vector<CatchPop> catchPops;
+    std::vector<ScorePopup> scorePopups;
 
     int score = 0;
     int lives = 7;
@@ -713,6 +789,8 @@ int main(int argc, char** argv) {
     bool highScoreResolved = false; // guards against re-checking the same game-over score every frame
     bool enteringName = false;      // true while the new-high-score name prompt is up
     bool paused = false;            // toggled with P, only while a round is actually in progress
+    bool confirmQuit = false;       // true while the "Quit? Y/N" prompt is up (ESC during an active round)
+    bool confirmClearScores = false; // true while the "Clear high scores? Y/N" prompt is up
     std::string nameInput;
 
     Uint32 lastTicks = SDL_GetTicks();
@@ -729,6 +807,8 @@ int main(int argc, char** argv) {
             startMusicPlayback(paused);
         } else if (gameOver && !enteringName) {
             babies.clear();
+            catchPops.clear();
+            scorePopups.clear();
             score = 0;
             lives = 7;
             level = 1;
@@ -783,24 +863,82 @@ int main(int argc, char** argv) {
                 continue;
             }
 
+            // While the "Quit?" or "Clear high scores?" confirmation prompts are
+            // up, keyboard input goes only to them (Y/Enter confirms, N/ESC cancels).
+            if (confirmQuit) {
+                if (e.type == SDL_KEYDOWN) {
+                    SDL_Keycode k = e.key.keysym.sym;
+                    if (k == SDLK_y || k == SDLK_RETURN) {
+                        running = false;
+                    } else if (k == SDLK_n || k == SDLK_ESCAPE) {
+                        confirmQuit = false;
+                        applyMusicDeviceState(paused); // resume - was paused while the prompt was up
+                    }
+                }
+                continue;
+            }
+            if (confirmClearScores) {
+                if (e.type == SDL_KEYDOWN) {
+                    SDL_Keycode k = e.key.keysym.sym;
+                    if (k == SDLK_y || k == SDLK_RETURN) {
+                        gHighScores.clear();
+                        saveHighScores();
+                        confirmClearScores = false;
+                    } else if (k == SDLK_n || k == SDLK_ESCAPE) {
+                        confirmClearScores = false;
+                    }
+                }
+                continue;
+            }
+
             if (e.type == SDL_KEYDOWN) {
                 SDL_Keycode k = e.key.keysym.sym;
                 if (k == SDLK_ESCAPE) {
                     if (showHighScores) showHighScores = false;      // close the high-score screen instead of quitting
                     else if (paused) { paused = false; applyMusicDeviceState(paused); } // unpause instead of quitting
-                    else running = false;
+                    else if (!introScreen && !gameOver) {
+                        confirmQuit = true;       // a round is actually in progress - confirm before losing it
+                        applyMusicDeviceState(true);
+                    } else {
+                        running = false;          // intro screen / game over: nothing to lose
+                    }
                 } else if (k == SDLK_h && (introScreen || gameOver)) {
                     showHighScores = !showHighScores;
                 } else if (showHighScores) {
-                    // any other key just closes the high-score screen
-                    showHighScores = false;
+                    if (k == SDLK_c) confirmClearScores = true; // any other key just closes the high-score screen below
+                    else showHighScores = false;
                 } else if (k == SDLK_p && !introScreen && !gameOver) {
                     paused = !paused;
                     applyMusicDeviceState(paused);
                 } else if (k == SDLK_m) {
                     gMusicMuted = !gMusicMuted;
-                    saveMusicMuted(gMusicMuted);
+                    saveMusicPrefs(gMusicMuted, gMusicVolume);
                     applyMusicDeviceState(paused);
+                    gHudStatusIdleTimer = 0.f;
+                } else if (k == SDLK_s) {
+                    gSfxMuted = !gSfxMuted;
+                    saveSfxPrefs(gSfxMuted, gSfxVolume);
+                    if (gSfxMuted && gAudioDev) SDL_ClearQueuedAudio(gAudioDev); // cut off anything already playing
+                    gHudStatusIdleTimer = 0.f;
+                } else if (k == SDLK_LEFTBRACKET) {
+                    gMusicVolume = std::clamp(gMusicVolume - 0.1f, 0.f, 1.f);
+                    saveMusicPrefs(gMusicMuted, gMusicVolume);
+                    gHudStatusIdleTimer = 0.f;
+                } else if (k == SDLK_RIGHTBRACKET) {
+                    gMusicVolume = std::clamp(gMusicVolume + 0.1f, 0.f, 1.f);
+                    saveMusicPrefs(gMusicMuted, gMusicVolume);
+                    gHudStatusIdleTimer = 0.f;
+                } else if (k == SDLK_COMMA) {
+                    gSfxVolume = std::clamp(gSfxVolume - 0.1f, 0.f, 1.f);
+                    saveSfxPrefs(gSfxMuted, gSfxVolume);
+                    gHudStatusIdleTimer = 0.f;
+                } else if (k == SDLK_PERIOD) {
+                    gSfxVolume = std::clamp(gSfxVolume + 0.1f, 0.f, 1.f);
+                    saveSfxPrefs(gSfxMuted, gSfxVolume);
+                    gHudStatusIdleTimer = 0.f;
+                } else if (k == SDLK_n) {
+                    advanceToNextTrack();
+                    if (gMusicDev) SDL_ClearQueuedAudio(gMusicDev); // drop whatever was left of the old track
                 } else if (k == SDLK_F11) {
                     isFullscreen = !isFullscreen;
                     SDL_SetWindowFullscreen(gWindow, isFullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
@@ -852,6 +990,7 @@ int main(int argc, char** argv) {
         }
 
         updateMusicStream();
+        gHudStatusIdleTimer += dt;
 
         if (!cursorHidden && (nowTicks - lastMouseActivity) >= CURSOR_IDLE_MS) {
             SDL_ShowCursor(SDL_DISABLE);
@@ -899,7 +1038,16 @@ int main(int argc, char** argv) {
                 }
             }
 
-            drawText("Press H, ESC, or any key to go back", SCREEN_W/2, SCREEN_H - 60, dim, gFont, true);
+            drawText("Press H, ESC, or any key to go back        C - clear scores", SCREEN_W/2, SCREEN_H - 60, dim, gFont, true);
+
+            if (confirmClearScores) {
+                SDL_Color overlay{ 0, 0, 0, 180 };
+                fillRect(0, 0, SCREEN_W, SCREEN_H, overlay);
+                drawText("Clear all high scores?", SCREEN_W/2, SCREEN_H/2 - 20, gold, gFontBig, true);
+                drawText("This can't be undone.", SCREEN_W/2, SCREEN_H/2 + 20, white, gFont, true);
+                drawText("Y - clear        N / ESC - cancel", SCREEN_W/2, SCREEN_H/2 + 55, white, gFont, true);
+            }
+
             SDL_RenderPresent(gRenderer);
             continue;
         }
@@ -928,7 +1076,7 @@ int main(int argc, char** argv) {
             // Dark translucent panel behind the title/instructions so they
             // stay readable over the busy scene.
             SDL_Color panel{ 10, 10, 20, 165 };
-            fillRect(0, SCREEN_H/2 - 195, SCREEN_W, 390, panel);
+            fillRect(0, SCREEN_H/2 - 215, SCREEN_W, 430, panel);
 
             SDL_Color white{ 255, 255, 255, 255 };
             SDL_Color gold{ 230, 210, 60, 255 };
@@ -938,13 +1086,14 @@ int main(int argc, char** argv) {
             drawText("1 / 2 / 3 - jump straight to a zone", SCREEN_W/2, SCREEN_H/2 + 10, white, gFont, true);
             drawText("Click a zone, or use a controller's stick/D-pad", SCREEN_W/2, SCREEN_H/2 + 40, white, gFont, true);
             drawText("F11 - toggle fullscreen        ESC - quit        H - high scores", SCREEN_W/2, SCREEN_H/2 + 70, white, gFont, true);
-            drawText("P - pause        M - mute/unmute music", SCREEN_W/2, SCREEN_H/2 + 100, white, gFont, true);
-            drawText("Press any key, click, or press a button to start", SCREEN_W/2, SCREEN_H/2 + 140, gold, gFont, true);
+            drawText("P - pause        M - mute music        S - mute sound        N - next track", SCREEN_W/2, SCREEN_H/2 + 100, white, gFont, true);
+            drawText("[ ] - music volume        , . - sound volume", SCREEN_W/2, SCREEN_H/2 + 130, white, gFont, true);
+            drawText("Press any key, click, or press a button to start", SCREEN_W/2, SCREEN_H/2 + 195, gold, gFont, true);
             SDL_RenderPresent(gRenderer);
             continue;
         }
 
-        if (!gameOver && !paused) {
+        if (!gameOver && !paused && !confirmQuit) {
             float gravity = 620.f;
             float groundLevel = (float)GROUND_Y - 20;   // true ground height (used for misses)
             float catchY = (float)GROUND_Y - 42;         // height of the stretcher surface (used for catches)
@@ -1016,6 +1165,7 @@ int main(int argc, char** argv) {
                             launchBounce(b, 0, 1, -420.f, gravity);
                             b.state = BabyState::Bounce1;
                             playBoing();
+                            catchPops.push_back({ b.x, b.y, 0.f });
                         } else {
                             b.y = groundLevel;
                             b.state = BabyState::Splat;
@@ -1038,6 +1188,7 @@ int main(int argc, char** argv) {
                                 launchBounce(b, 1, 2, -320.f, gravity);
                                 b.state = BabyState::Bounce2;
                                 playBoing();
+                                catchPops.push_back({ b.x, b.y, 0.f });
                             } else {
                                 b.y = groundLevel;
                                 b.state = BabyState::Splat; b.splatTimer = 0.f; playSplat();
@@ -1052,6 +1203,7 @@ int main(int argc, char** argv) {
                                 b.vx = 160.f;
                                 b.state = BabyState::Bounce3;
                                 playBoing();
+                                catchPops.push_back({ b.x, b.y, 0.f });
                             } else {
                                 b.y = groundLevel;
                                 b.state = BabyState::Splat; b.splatTimer = 0.f; playSplat();
@@ -1075,7 +1227,9 @@ int main(int argc, char** argv) {
                     b.y -= 25.f * dt;
                     if (b.x >= (float)AMBULANCE_X + 45.f) {
                         b.state = BabyState::Gone;
-                        score += 10 * level;
+                        int gained = 10 * level;
+                        score += gained;
+                        scorePopups.push_back({ "+" + std::to_string(gained), b.x, b.y, 0.f });
                     }
                 } else if (b.state == BabyState::Splat) {
                     b.splatTimer += dt;
@@ -1096,6 +1250,13 @@ int main(int argc, char** argv) {
             level = 1 + (int)std::sqrt((double)score / 40.0);
             if (level > prevLevel) { playLevelUp(); levelUpBannerTimer = 1.8f; }
             if (levelUpBannerTimer > 0.f) levelUpBannerTimer -= dt;
+
+            for (auto& p : catchPops) p.timer += dt;
+            catchPops.erase(std::remove_if(catchPops.begin(), catchPops.end(),
+                [](const CatchPop& p) { return p.timer >= CATCH_POP_DUR; }), catchPops.end());
+            for (auto& p : scorePopups) p.timer += dt;
+            scorePopups.erase(std::remove_if(scorePopups.begin(), scorePopups.end(),
+                [](const ScorePopup& p) { return p.timer >= SCORE_POPUP_DUR; }), scorePopups.end());
         }
 
         if (gameOver && !highScoreResolved) {
@@ -1125,9 +1286,55 @@ int main(int argc, char** argv) {
         for (auto& b : babies) drawBaby(b);
         drawFirefighters(ff);
 
+        // Catch pops: expanding, fading ring at each successful catch.
+        {
+            for (const auto& p : catchPops) {
+                float t = std::clamp(p.timer / CATCH_POP_DUR, 0.f, 1.f);
+                int radius = (int)(10.f + t * 22.f);
+                SDL_Color ring{ 255, 240, 150, (Uint8)((1.f - t) * 180.f) };
+                fillCircle((int)p.x, (int)p.y, radius, ring);
+            }
+        }
+
+        // Score popups: "+N" rising and fading at the moment score is awarded.
+        {
+            for (const auto& p : scorePopups) {
+                float t = std::clamp(p.timer / SCORE_POPUP_DUR, 0.f, 1.f);
+                int riseY = (int)(t * 40.f);
+                SDL_Color gold{ 255, 220, 80, (Uint8)((1.f - t) * 255.f) };
+                drawText(p.text, (int)p.x, (int)p.y - riseY - 20, gold, gFontBig, true);
+            }
+        }
+
         SDL_Color white{ 255, 255, 255, 255 };
         drawText("Lives: " + std::to_string(std::max(0, lives)), 20, 15, white, gFont);
         drawText("Level: " + std::to_string(level), 20, 45, white, gFont);
+
+        // Mute/volume status + now-playing track - shown like a volume-overlay
+        // toast: full brightness right after a change, then fades out and
+        // disappears if nothing's changed for a few seconds.
+        {
+            float fadeT = std::clamp((gHudStatusIdleTimer - HUD_STATUS_HOLD_SEC) / HUD_STATUS_FADE_SEC, 0.f, 1.f);
+            Uint8 alpha = (Uint8)((1.f - fadeT) * 210.f);
+            if (alpha > 0) {
+                SDL_Color dimHud{ 190, 190, 200, alpha };
+                std::string musicStatus = gMusicMuted ? "Music: MUTED"
+                    : ("Music: " + std::to_string((int)std::lround(gMusicVolume * 100.f)) + "%");
+                std::string sfxStatus = gSfxMuted ? "SFX: MUTED"
+                    : ("SFX: " + std::to_string((int)std::lround(gSfxVolume * 100.f)) + "%");
+                drawText(musicStatus + "     " + sfxStatus, 20, 75, dimHud, gFont);
+
+                if (gMusicActive && kMusicTrackCount > 0 && gCurrentTrackIdx >= 0) {
+                    std::string trackName = kMusicTracks[gCurrentTrackIdx].name;
+                    const std::string ext = ".mid";
+                    if (trackName.size() > ext.size() &&
+                        trackName.compare(trackName.size() - ext.size(), ext.size(), ext) == 0) {
+                        trackName.resize(trackName.size() - ext.size());
+                    }
+                    drawText("Now playing: " + trackName, 20, 100, dimHud, gFont);
+                }
+            }
+        }
 
         // big score text, top right (no box/border)
         {
@@ -1164,6 +1371,15 @@ int main(int argc, char** argv) {
             fillRect(0, 0, SCREEN_W, SCREEN_H, overlay);
             drawText("PAUSED", SCREEN_W/2, SCREEN_H/2 - 20, white, gFontBig, true);
             drawText("Press P to resume        ESC to unpause", SCREEN_W/2, SCREEN_H/2 + 30, white, gFont, true);
+        }
+
+        if (confirmQuit) {
+            SDL_Color overlay{ 0, 0, 0, 180 };
+            fillRect(0, 0, SCREEN_W, SCREEN_H, overlay);
+            SDL_Color gold{ 230, 210, 60, 255 };
+            drawText("Quit to desktop?", SCREEN_W/2, SCREEN_H/2 - 20, gold, gFontBig, true);
+            drawText("Your current run will be lost.", SCREEN_W/2, SCREEN_H/2 + 20, white, gFont, true);
+            drawText("Y - quit        N / ESC - cancel", SCREEN_W/2, SCREEN_H/2 + 55, white, gFont, true);
         }
 
         if (gameOver) {
