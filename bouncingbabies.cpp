@@ -22,7 +22,7 @@
 
 // MIDI-rendered music/SFX (OPL3 synth, rendered to PCM once at startup).
 #include "midi_render.h"
-#include "music_gladiators_mid.h"
+#include "music_tracks.h"   // generated/music_tracks.h - kMusicTracks[], from midi/music/*.mid
 #include "sfx_levelup_mid.h"
 
 static const int SCREEN_W = 800;
@@ -69,10 +69,23 @@ static SDL_AudioSpec gAudioSpec;
 // device play back-to-back, not layered, so music needs its own stream).
 static SDL_AudioDeviceID gMusicDev = 0;
 static SDL_AudioSpec gMusicSpec;
-static std::vector<Sint16> gMusicPCM;   // "Entry of the Gladiators", mono 16-bit
-static size_t gMusicPos = 0;            // playback position for manual looping
 static bool gMusicMuted = false;        // persisted preference, toggled with M
 static bool gMusicActive = false;       // true only while a round is actually in progress
+
+// One rendered PCM buffer per entry in kMusicTracks (generated/music_tracks.h,
+// built from whatever's in midi/music/). Index-parallel with kMusicTracks.
+static std::vector<std::vector<Sint16>> gTrackPCM;
+
+// Shuffled play order (indices into kMusicTracks/gTrackPCM), reshuffled
+// whenever it's exhausted. gCurrentTrackIdx/gMusicPos track where we are
+// in the currently-playing track; gLastFinishedTrackIdx is checked when
+// reshuffling so a fresh shuffle doesn't immediately repeat the track
+// that just finished.
+static std::vector<int> gPlaylist;
+static size_t gPlaylistPos = 0;
+static int gCurrentTrackIdx = -1;
+static int gLastFinishedTrackIdx = -1;
+static size_t gMusicPos = 0;            // playback position within the current track's PCM
 
 static std::vector<Sint16> gLevelUpPCM; // level-up jingle, mono 16-bit
 
@@ -184,21 +197,65 @@ static std::vector<Sint16> loadOrRenderMidiAsset(const unsigned char* midiBytes,
     return pcm;
 }
 
-// Tops off the music queue when it's running low, looping back to the
-// start of the track. Call once per frame from the main loop.
+// Turns a track's display name (e.g. "Entry of the Gladiators!.mid") into
+// a safe, unique-enough disk cache filename fragment.
+static std::string sanitizeForFilename(const std::string& s) {
+    std::string out;
+    for (char c : s) {
+        bool ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');
+        out += ok ? c : '_';
+    }
+    return out;
+}
+
+// Builds a freshly-shuffled play order across all of kMusicTracks. If
+// avoidFirstIdx is a valid track index and there's more than one track,
+// makes sure the new shuffle doesn't start with that same track - used so
+// looping back around to a new shuffle doesn't immediately repeat whatever
+// track just finished.
+static void reshufflePlaylist(int avoidFirstIdx) {
+    int n = kMusicTrackCount;
+    gPlaylist.resize(n);
+    for (int i = 0; i < n; i++) gPlaylist[i] = i;
+    for (int i = n - 1; i > 0; i--) {
+        int j = rand() % (i + 1);
+        std::swap(gPlaylist[i], gPlaylist[j]);
+    }
+    if (n > 1 && gPlaylist[0] == avoidFirstIdx) std::swap(gPlaylist[0], gPlaylist[1]);
+    gPlaylistPos = 0;
+}
+
+// Moves playback to the next track in the shuffled order, reshuffling
+// (without immediately repeating the track that just finished) once the
+// current shuffle is exhausted.
+static void advanceToNextTrack() {
+    if (kMusicTrackCount == 0) { gCurrentTrackIdx = -1; return; }
+    gLastFinishedTrackIdx = gCurrentTrackIdx;
+    gPlaylistPos++;
+    if (gPlaylistPos >= gPlaylist.size()) reshufflePlaylist(gLastFinishedTrackIdx);
+    gCurrentTrackIdx = gPlaylist[gPlaylistPos];
+    gMusicPos = 0;
+}
+
+// Tops off the music queue when it's running low, advancing to the next
+// shuffled track whenever the current one runs out. Call once per frame.
 static void updateMusicStream() {
     if (!gMusicActive || gMusicMuted) return;
-    if (gMusicDev == 0 || gMusicPCM.empty()) return;
+    if (gMusicDev == 0 || kMusicTrackCount == 0 || gCurrentTrackIdx < 0) return;
 
     const Uint32 lowWaterBytes = gMusicSpec.freq * sizeof(Sint16) / 2; // ~0.5s
     const size_t chunkFrames = gMusicSpec.freq;                        // ~1s per top-off
 
-    while (SDL_GetQueuedAudioSize(gMusicDev) < lowWaterBytes) {
-        size_t remaining = gMusicPCM.size() - gMusicPos;
+    int safety = kMusicTrackCount + 1; // guards against an all-empty (failed-render) library
+    while (SDL_GetQueuedAudioSize(gMusicDev) < lowWaterBytes && safety-- > 0) {
+        const std::vector<Sint16>& pcm = gTrackPCM[gCurrentTrackIdx];
+        if (pcm.empty()) { advanceToNextTrack(); continue; }
+
+        size_t remaining = pcm.size() - gMusicPos;
         size_t n = std::min(chunkFrames, remaining);
-        SDL_QueueAudio(gMusicDev, gMusicPCM.data() + gMusicPos, (Uint32)(n * sizeof(Sint16)));
+        SDL_QueueAudio(gMusicDev, pcm.data() + gMusicPos, (Uint32)(n * sizeof(Sint16)));
         gMusicPos += n;
-        if (gMusicPos >= gMusicPCM.size()) gMusicPos = 0; // loop
+        if (gMusicPos >= pcm.size()) advanceToNextTrack();
     }
 }
 
@@ -211,10 +268,14 @@ static void applyMusicDeviceState(bool gamePaused) {
 }
 
 // Called when a round starts (from the intro screen, or on restart after
-// game over) - restarts the track from the beginning.
+// game over) - shuffles a fresh play order and starts from its first track.
 static void startMusicPlayback(bool gamePaused) {
     gMusicActive = true;
-    gMusicPos = 0;
+    if (kMusicTrackCount > 0) {
+        reshufflePlaylist(-1);
+        gCurrentTrackIdx = gPlaylist[0];
+        gMusicPos = 0;
+    }
     if (gMusicDev) SDL_ClearQueuedAudio(gMusicDev);
     applyMusicDeviceState(gamePaused);
 }
@@ -604,11 +665,17 @@ int main(int argc, char** argv) {
 
     gMusicMuted = loadMusicMuted();
 
-    // Render the embedded MIDI assets (OPL3 synth) to PCM once, up front -
-    // or load them from the disk cache (see loadOrRenderMidiAsset) if a
-    // prior run already rendered and cached them, which skips the synth
-    // entirely and cuts this down to a fast file read.
-    gMusicPCM = loadOrRenderMidiAsset(bb_music_gladiators_mid, bb_music_gladiators_mid_len, "music_cache.bin");
+    // Render every embedded MIDI asset (OPL3 synth) to PCM once, up front -
+    // or load each from the disk cache (see loadOrRenderMidiAsset) if a
+    // prior run already rendered and cached it, which skips the synth
+    // entirely and cuts this down to a fast file read. One cache file per
+    // music track, named from its own filename, so adding/removing tracks
+    // in midi/music/ never collides with or invalidates another track's cache.
+    gTrackPCM.resize(kMusicTrackCount);
+    for (int i = 0; i < kMusicTrackCount; i++) {
+        std::string cacheFile = "music_" + sanitizeForFilename(kMusicTracks[i].name) + ".bin";
+        gTrackPCM[i] = loadOrRenderMidiAsset(kMusicTracks[i].data, kMusicTracks[i].len, cacheFile);
+    }
     gLevelUpPCM = loadOrRenderMidiAsset(bb_sfx_levelup_mid, bb_sfx_levelup_mid_len, "sfx_levelup_cache.bin", /*normalize=*/true);
 
     // Optional joystick/gamepad: opens the first one plugged in, if any.
