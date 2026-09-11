@@ -430,6 +430,7 @@ int main(int argc, char** argv) {
     bool showHighScores = false;   // toggled with H, only reachable from intro/game-over
     bool highScoreResolved = false; // guards against re-checking the same game-over score every frame
     bool enteringName = false;      // true while the new-high-score name prompt is up
+    bool paused = false;            // toggled with P, only while a round is actually in progress
     std::string nameInput;
 
     Uint32 lastTicks = SDL_GetTicks();
@@ -453,12 +454,12 @@ int main(int argc, char** argv) {
     };
     auto doCycle = [&](int dir) { // dir: -1 = left, +1 = right
         if (introScreen) { introScreen = false; return; }
-        if (gameOver) return;
+        if (gameOver || paused) return;
         ff.zone = (ff.zone + dir + 3) % 3;
     };
     auto doSelectZone = [&](int zone) {
         if (introScreen) { introScreen = false; return; }
-        if (gameOver) return;
+        if (gameOver || paused) return;
         ff.zone = zone;
     };
 
@@ -497,13 +498,16 @@ int main(int argc, char** argv) {
             if (e.type == SDL_KEYDOWN) {
                 SDL_Keycode k = e.key.keysym.sym;
                 if (k == SDLK_ESCAPE) {
-                    if (showHighScores) showHighScores = false; // close the high-score screen instead of quitting
+                    if (showHighScores) showHighScores = false;      // close the high-score screen instead of quitting
+                    else if (paused) paused = false;                  // unpause instead of quitting
                     else running = false;
                 } else if (k == SDLK_h && (introScreen || gameOver)) {
                     showHighScores = !showHighScores;
                 } else if (showHighScores) {
                     // any other key just closes the high-score screen
                     showHighScores = false;
+                } else if (k == SDLK_p && !introScreen && !gameOver) {
+                    paused = !paused;
                 } else if (k == SDLK_F11) {
                     isFullscreen = !isFullscreen;
                     SDL_SetWindowFullscreen(gWindow, isFullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
@@ -634,7 +638,7 @@ int main(int argc, char** argv) {
             continue;
         }
 
-        if (!gameOver) {
+        if (!gameOver && !paused) {
             float gravity = 620.f;
             float groundLevel = (float)GROUND_Y - 20;   // true ground height (used for misses)
             float catchY = (float)GROUND_Y - 42;         // height of the stretcher surface (used for catches)
@@ -818,6 +822,13 @@ int main(int argc, char** argv) {
             SDL_Color label{ 200, 200, 210, 255 };
             drawText("SCORE", x + areaW/2, y, label, gFont, true);
             drawText(std::to_string(score), x + areaW/2, y + 24, white, gFontBig, true);
+        }
+
+        if (paused) {
+            SDL_Color overlay{ 0, 0, 0, 150 };
+            fillRect(0, 0, SCREEN_W, SCREEN_H, overlay);
+            drawText("PAUSED", SCREEN_W/2, SCREEN_H/2 - 20, white, gFontBig, true);
+            drawText("Press P to resume        ESC to unpause", SCREEN_W/2, SCREEN_H/2 + 30, white, gFont, true);
         }
 
         if (gameOver) {
