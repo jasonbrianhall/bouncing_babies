@@ -71,6 +71,8 @@ static SDL_AudioDeviceID gMusicDev = 0;
 static SDL_AudioSpec gMusicSpec;
 static std::vector<Sint16> gMusicPCM;   // "Entry of the Gladiators", mono 16-bit
 static size_t gMusicPos = 0;            // playback position for manual looping
+static bool gMusicMuted = false;        // persisted preference, toggled with M
+static bool gMusicActive = false;       // true only while a round is actually in progress
 
 static std::vector<Sint16> gLevelUpPCM; // level-up jingle, mono 16-bit
 
@@ -96,6 +98,7 @@ static std::vector<Sint16> renderMidiToMonoPCM(const unsigned char* midiBytes, u
 // Tops off the music queue when it's running low, looping back to the
 // start of the track. Call once per frame from the main loop.
 static void updateMusicStream() {
+    if (!gMusicActive || gMusicMuted) return;
     if (gMusicDev == 0 || gMusicPCM.empty()) return;
 
     const Uint32 lowWaterBytes = gMusicSpec.freq * sizeof(Sint16) / 2; // ~0.5s
@@ -108,6 +111,30 @@ static void updateMusicStream() {
         gMusicPos += n;
         if (gMusicPos >= gMusicPCM.size()) gMusicPos = 0; // loop
     }
+}
+
+// Single source of truth for whether the music device should actually be
+// producing sound: only while a round is active, not muted, and not paused.
+static void applyMusicDeviceState(bool gamePaused) {
+    if (!gMusicDev) return;
+    bool shouldPlay = gMusicActive && !gMusicMuted && !gamePaused;
+    SDL_PauseAudioDevice(gMusicDev, shouldPlay ? 0 : 1);
+}
+
+// Called when a round starts (from the intro screen, or on restart after
+// game over) - restarts the track from the beginning.
+static void startMusicPlayback(bool gamePaused) {
+    gMusicActive = true;
+    gMusicPos = 0;
+    if (gMusicDev) SDL_ClearQueuedAudio(gMusicDev);
+    applyMusicDeviceState(gamePaused);
+}
+
+// Called the moment lives hit 0.
+static void stopMusicPlayback() {
+    gMusicActive = false;
+    if (gMusicDev) SDL_ClearQueuedAudio(gMusicDev);
+    applyMusicDeviceState(false);
 }
 
 // Current oversampling factor the loaded fonts were rendered at. When the
@@ -208,6 +235,27 @@ std::string highScoreFilePath() {
     std::string path = pref ? (std::string(pref) + "highscores.txt") : "highscores.txt";
     if (pref) SDL_free(pref);
     return path;
+}
+
+// ---- Music mute preference ----
+// Same pref directory as high scores, one line: "1" (muted) or "0" (unmuted).
+std::string musicPrefFilePath() {
+    char* pref = SDL_GetPrefPath("", "BouncingBabies");
+    std::string path = pref ? (std::string(pref) + "musicpref.txt") : "musicpref.txt";
+    if (pref) SDL_free(pref);
+    return path;
+}
+
+bool loadMusicMuted() {
+    std::ifstream in(musicPrefFilePath());
+    int v = 0;
+    if (in >> v) return v != 0;
+    return false; // default: unmuted
+}
+
+void saveMusicMuted(bool muted) {
+    std::ofstream out(musicPrefFilePath(), std::ios::trunc);
+    out << (muted ? 1 : 0) << "\n";
 }
 
 void sortAndTrimHighScores() {
@@ -463,7 +511,9 @@ int main(int argc, char** argv) {
     wantMusic.channels = 1;
     wantMusic.samples = 2048;
     gMusicDev = SDL_OpenAudioDevice(nullptr, 0, &wantMusic, &gMusicSpec, 0);
-    if (gMusicDev) SDL_PauseAudioDevice(gMusicDev, 0);
+    if (gMusicDev) SDL_PauseAudioDevice(gMusicDev, 1); // stays silent until a round actually starts
+
+    gMusicMuted = loadMusicMuted();
 
     // Render the embedded MIDI assets (OPL3 synth) to PCM once, up front.
     // Fast (well under a second for the full ~3 minute track) so it's done
@@ -508,6 +558,9 @@ int main(int argc, char** argv) {
     std::string nameInput;
 
     Uint32 lastTicks = SDL_GetTicks();
+    Uint32 lastMouseActivity = SDL_GetTicks();
+    bool cursorHidden = false;
+    static const Uint32 CURSOR_IDLE_MS = 3000; // hide after 3s of no mouse movement
 
     // Shared input actions so keyboard, mouse, and joystick/controller all
     // drive the exact same behavior instead of duplicating this logic per
@@ -515,6 +568,7 @@ int main(int argc, char** argv) {
     auto doConfirm = [&]() {
         if (introScreen) {
             introScreen = false;
+            startMusicPlayback(paused);
         } else if (gameOver && !enteringName) {
             babies.clear();
             score = 0;
@@ -524,6 +578,7 @@ int main(int argc, char** argv) {
             doubleSpawnTimer = -1.f;
             gameOver = false;
             highScoreResolved = false;
+            startMusicPlayback(paused);
         }
     };
     auto doCycle = [&](int dir) { // dir: -1 = left, +1 = right
@@ -573,7 +628,7 @@ int main(int argc, char** argv) {
                 SDL_Keycode k = e.key.keysym.sym;
                 if (k == SDLK_ESCAPE) {
                     if (showHighScores) showHighScores = false;      // close the high-score screen instead of quitting
-                    else if (paused) { paused = false; if (gMusicDev) SDL_PauseAudioDevice(gMusicDev, 0); } // unpause instead of quitting
+                    else if (paused) { paused = false; applyMusicDeviceState(paused); } // unpause instead of quitting
                     else running = false;
                 } else if (k == SDLK_h && (introScreen || gameOver)) {
                     showHighScores = !showHighScores;
@@ -582,7 +637,11 @@ int main(int argc, char** argv) {
                     showHighScores = false;
                 } else if (k == SDLK_p && !introScreen && !gameOver) {
                     paused = !paused;
-                    if (gMusicDev) SDL_PauseAudioDevice(gMusicDev, paused ? 1 : 0);
+                    applyMusicDeviceState(paused);
+                } else if (k == SDLK_m) {
+                    gMusicMuted = !gMusicMuted;
+                    saveMusicMuted(gMusicMuted);
+                    applyMusicDeviceState(paused);
                 } else if (k == SDLK_F11) {
                     isFullscreen = !isFullscreen;
                     SDL_SetWindowFullscreen(gWindow, isFullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
@@ -593,7 +652,12 @@ int main(int argc, char** argv) {
                 else if (k == SDLK_3) doSelectZone(2);
                 else if (k == SDLK_RETURN) doConfirm();
                 else if (introScreen && k != SDLK_ESCAPE) doConfirm(); // any other key on the intro screen starts the game
+            } else if (e.type == SDL_MOUSEMOTION) {
+                lastMouseActivity = nowTicks;
+                if (cursorHidden) { SDL_ShowCursor(SDL_ENABLE); cursorHidden = false; }
             } else if (e.type == SDL_MOUSEBUTTONDOWN && e.button.button == SDL_BUTTON_LEFT) {
+                lastMouseActivity = nowTicks;
+                if (cursorHidden) { SDL_ShowCursor(SDL_ENABLE); cursorHidden = false; }
                 if (showHighScores) {
                     showHighScores = false;
                 } else if (introScreen || gameOver) {
@@ -629,6 +693,11 @@ int main(int argc, char** argv) {
         }
 
         updateMusicStream();
+
+        if (!cursorHidden && (nowTicks - lastMouseActivity) >= CURSOR_IDLE_MS) {
+            SDL_ShowCursor(SDL_DISABLE);
+            cursorHidden = true;
+        }
 
         ff.x = (float)ZONE_X[ff.zone];
         flamePhase += dt;
@@ -700,7 +769,7 @@ int main(int argc, char** argv) {
             // Dark translucent panel behind the title/instructions so they
             // stay readable over the busy scene.
             SDL_Color panel{ 10, 10, 20, 165 };
-            fillRect(0, SCREEN_H/2 - 190, SCREEN_W, 360, panel);
+            fillRect(0, SCREEN_H/2 - 195, SCREEN_W, 390, panel);
 
             SDL_Color white{ 255, 255, 255, 255 };
             SDL_Color gold{ 230, 210, 60, 255 };
@@ -710,7 +779,8 @@ int main(int argc, char** argv) {
             drawText("1 / 2 / 3 - jump straight to a zone", SCREEN_W/2, SCREEN_H/2 + 10, white, gFont, true);
             drawText("Click a zone, or use a controller's stick/D-pad", SCREEN_W/2, SCREEN_H/2 + 40, white, gFont, true);
             drawText("F11 - toggle fullscreen        ESC - quit        H - high scores", SCREEN_W/2, SCREEN_H/2 + 70, white, gFont, true);
-            drawText("Press any key, click, or press a button to start", SCREEN_W/2, SCREEN_H/2 + 120, gold, gFont, true);
+            drawText("P - pause        M - mute/unmute music", SCREEN_W/2, SCREEN_H/2 + 100, white, gFont, true);
+            drawText("Press any key, click, or press a button to start", SCREEN_W/2, SCREEN_H/2 + 140, gold, gFont, true);
             SDL_RenderPresent(gRenderer);
             continue;
         }
@@ -793,7 +863,7 @@ int main(int argc, char** argv) {
                             b.splatTimer = 0.f;
                             playSplat();
                             lives--;
-                            if (lives <= 0) { gameOver = true; playGameOver(); }
+                            if (lives <= 0) { gameOver = true; playGameOver(); stopMusicPlayback(); }
                         }
                     }
                 } else if (b.state == BabyState::Bounce1 || b.state == BabyState::Bounce2) {
@@ -812,7 +882,7 @@ int main(int argc, char** argv) {
                             } else {
                                 b.y = groundLevel;
                                 b.state = BabyState::Splat; b.splatTimer = 0.f; playSplat();
-                                lives--; if (lives <= 0) { gameOver = true; playGameOver(); }
+                                lives--; if (lives <= 0) { gameOver = true; playGameOver(); stopMusicPlayback(); }
                             }
                         } else { // Bounce2
                             if (caught) {
@@ -826,7 +896,7 @@ int main(int argc, char** argv) {
                             } else {
                                 b.y = groundLevel;
                                 b.state = BabyState::Splat; b.splatTimer = 0.f; playSplat();
-                                lives--; if (lives <= 0) { gameOver = true; playGameOver(); }
+                                lives--; if (lives <= 0) { gameOver = true; playGameOver(); stopMusicPlayback(); }
                             }
                         }
                     }
